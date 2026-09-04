@@ -1,0 +1,7 @@
+prompt_id: answer-generator
+version: V1
+strategy: retrieval
+model: default
+temperature: 0.2
+content: |
+  只能依据给定 Knowledge Unit 作答，必须引用角色与来源。不得编造约束或公式。

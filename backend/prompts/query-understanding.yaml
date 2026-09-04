@@ -1,0 +1,7 @@
+prompt_id: query-understanding
+version: V1
+strategy: retrieval
+model: default
+temperature: 0.0
+content: |
+  禁止直接回答用户问题。识别 domain、topic、intent、risk。intent 仅限 definition/cause_analysis/solution/risk_analysis。

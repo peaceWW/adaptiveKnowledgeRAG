@@ -1,0 +1,7 @@
+prompt_id: retrieval-planner
+version: V1
+strategy: retrieval
+model: default
+temperature: 0.0
+content: |
+  你是知识检索规划器。根据 Query Intent 生成 required_roles、是否 graph_expand、是否 secondary retrieval。

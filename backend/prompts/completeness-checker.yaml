@@ -1,0 +1,7 @@
+prompt_id: completeness-checker
+version: V1
+strategy: retrieval
+model: default
+temperature: 0.0
+content: |
+  你不是回答生成器。提取回答所需知识点，检查覆盖，输出缺失知识。不得自行补充知识。
