@@ -1,9 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, func
+from time import perf_counter
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import DocumentIndexUpdate, KeywordDelete, KeywordIndexItem, MetadataFieldDelete, PlannerUpdate
-from app.deps import get_stores
+from app.deps import get_stores, current_user
+from app.domain.enums import RETRIEVAL_LIFECYCLES
+from app.retrieval.workflow import QueryWorkflow
 from app.retrieval.doc_index import (
     document_index_blob,
     ensure_document_index,
@@ -13,9 +17,66 @@ from app.retrieval.doc_index import (
     unit_count_map,
 )
 from app.storage.db import get_session
-from app.storage.models import Document, RetrievalPlannerConfig
+from app.storage.models import Document, RetrievalPlannerConfig, KnowledgeUnit, KnowledgeBase, KnowledgeAcl, User
 
 router = APIRouter(prefix="/retrieval", tags=["retrieval"])
+
+
+class RetrievalTestRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=2000)
+    kb_id: str = Field(min_length=1)
+    top_k: int = Field(default=8, ge=1, le=20)
+
+    @field_validator("query")
+    @classmethod
+    def clean_query(cls, value):
+        if not value.strip():
+            raise ValueError("请输入需要检索的问题")
+        return value.strip()
+
+
+@router.post("/test")
+async def test_retrieval(payload: RetrievalTestRequest, session: AsyncSession = Depends(get_session), user: User = Depends(current_user)):
+    kb = await session.get(KnowledgeBase, payload.kb_id)
+    if not kb:
+        raise HTTPException(404, "知识库不存在")
+    rules = (await session.execute(select(KnowledgeAcl).where(KnowledgeAcl.kb_id == kb.id))).scalars().all()
+    permitted = user.role == "admin" or kb.access_scope == "public"
+    permitted |= kb.access_scope == "department" and bool(user.department) and kb.department == user.department
+    permitted |= kb.access_scope == "project" and bool(user.project) and kb.project == user.project
+    permitted |= any(r.permission in {"read", "write", "admin"} and (
+        (r.principal_type == "user" and r.principal_id == user.id) or
+        (r.principal_type == "role" and r.principal_id == user.role)
+    ) for r in rules)
+    if not permitted:
+        raise HTTPException(403, "无权检索该知识库")
+    stores = get_stores()
+    workflow = QueryWorkflow(session, stores.gateway, stores.qdrant, stores.es, stores.neo4j)
+    started = perf_counter()
+    state = {"query": payload.query, "kb_id": payload.kb_id, "user_id": user.id}
+    stages = []
+    for key, label in [("understand", "理解问题"), ("plan", "确定检索范围"), ("retrieve", "召回、重排与关联展开")]:
+        step_start = perf_counter()
+        state = await getattr(workflow, key)(state)
+        stages.append({"key": key, "label": label, "elapsed_ms": int((perf_counter() - step_start) * 1000)})
+    hits = state.get("hits") or []
+    docs = {d.id: d for d in (await session.execute(select(Document).where(Document.kb_id == kb.id))).scalars().all()}
+    visible = []
+    for hit in hits[:payload.top_k]:
+        item = dict(hit)
+        doc = docs.get(item.get("document_id"))
+        item["filename"] = doc.filename if doc else ""
+        item["document_title"] = ((doc.index_meta or {}).get("title") or doc.filename) if doc else "未关联文档"
+        visible.append(item)
+    return {"query": payload.query, "kb_id": kb.id, "kb_name": kb.name,
+            "hits": visible, "total": len(hits), "stages": stages,
+            "elapsed_ms": int((perf_counter() - started) * 1000),
+            "understanding": state.get("understanding") or {}, "plan": state.get("plan") or {},
+            "retrieval": state.get("retrieval") or {},
+            "services": {"vector": bool(getattr(stores.qdrant, "available", False)),
+                         "keyword": bool(getattr(stores.es, "available", False)),
+                         "graph": bool(getattr(stores.neo4j, "available", False)),
+                         "model": bool(getattr(stores.gateway, "client", None))}}
 
 
 async def _load_doc(session: AsyncSession, doc_id: str) -> Document:
@@ -27,34 +88,26 @@ async def _load_doc(session: AsyncSession, doc_id: str) -> Document:
 
 @router.get("/indexes")
 async def list_indexes(kb_id: str | None = None, q: str | None = None, session: AsyncSession = Depends(get_session)):
-    stores = get_stores()
     stmt = select(Document).order_by(Document.created_at.desc())
     if kb_id:
         stmt = stmt.where(Document.kb_id == kb_id)
     docs = (await session.execute(stmt)).scalars().all()
-    dirty_docs: list[Document] = []
     needle = (q or "").strip().lower()
     visible: list[Document] = []
     for doc in docs:
-        if await ensure_document_index(session, doc, stores.es, commit=False):
-            dirty_docs.append(doc)
         if needle and needle not in document_index_blob(doc):
             continue
         visible.append(doc)
-    if dirty_docs:
-        await session.commit()
-        for doc in dirty_docs:
-            await session.refresh(doc)
-            await sync_document_index(stores.es, doc)
     counts = await unit_count_map(session, [doc.id for doc in visible])
-    return [serialize_document_index(doc, counts.get(doc.id, 0)) for doc in visible]
+    ready = dict((await session.execute(select(KnowledgeUnit.document_id, func.count(KnowledgeUnit.id)).where(
+        KnowledgeUnit.document_id.in_([d.id for d in visible]), KnowledgeUnit.lifecycle.in_(list(RETRIEVAL_LIFECYCLES))
+    ).group_by(KnowledgeUnit.document_id))).all())
+    return [{**serialize_document_index(doc, counts.get(doc.id, 0)), "retrievable_count": ready.get(doc.id, 0)} for doc in visible]
 
 
 @router.get("/indexes/{doc_id}")
 async def get_index(doc_id: str, session: AsyncSession = Depends(get_session)):
-    stores = get_stores()
     doc = await _load_doc(session, doc_id)
-    await ensure_document_index(session, doc, stores.es)
     counts = await unit_count_map(session, [doc.id])
     return serialize_document_index(doc, counts.get(doc.id, 0))
 

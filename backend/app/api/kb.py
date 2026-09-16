@@ -5,8 +5,10 @@ from sqlalchemy.orm import selectinload
 
 from app.api.documents import document_original_text
 from app.api.schemas import CatalogNodeCreate, KnowledgeBaseCreate
+from app.ingestion.catalog_sync import catalog_needs_rebuild, public_related, sync_catalog_for_kb, unit_id_from_related
 from app.storage.db import get_session
 from app.storage.models import Document, KnowledgeBase, KnowledgeCatalog, KnowledgeUnit
+from app.storage.paths import attach_image_refs
 
 router = APIRouter(prefix="/knowledge-bases", tags=["knowledge-bases"])
 
@@ -66,13 +68,15 @@ async def get_kb(kb_id: str, session: AsyncSession = Depends(get_session)):
 
 def _catalog_item(node: KnowledgeCatalog, child_ids: set[str] | None = None) -> dict:
     children = child_ids or set()
+    related = node.related_concepts or []
     return {
         "id": node.id,
         "parent_id": node.parent_id,
         "name": node.name,
         "path": node.path,
         "level": node.level,
-        "related_concepts": node.related_concepts or [],
+        "related_concepts": public_related(related),
+        "unit_id": unit_id_from_related(related),
         "is_leaf": node.id not in children,
     }
 
@@ -99,14 +103,49 @@ def _snippet_window(text: str, needle: str, radius: int = 220) -> str:
 
 
 def _unit_matches_node(unit: KnowledgeUnit, node: KnowledgeCatalog) -> bool:
+    """叶子优先按 catalog_id / __unit__ 精确对应，避免章节名模糊命中整篇。"""
     if unit.catalog_id == node.id:
         return True
-    keywords = {str(item).lower() for item in ([node.name] + list(node.related_concepts or [])) if item}
-    concepts = {str(item).lower() for item in (unit.concepts or [])}
-    if keywords & concepts:
-        return True
-    blob = f"{unit.title} {unit.content} {unit.source_span} {unit.source_section}".lower()
-    return any(key in blob for key in keywords)
+    tagged = unit_id_from_related(node.related_concepts)
+    return bool(tagged) and tagged == unit.id
+
+
+def _descendant_path_pattern(path: str) -> str:
+    """LIKE 前缀匹配子节点；转义 %/_，避免文章名里的下划线把别的节点也扫进来。"""
+    escaped = str(path or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"{escaped}/%"
+
+
+def _quote_from_unit(unit: KnowledgeUnit, documents_map: dict[str, Document]) -> dict:
+    """目录详情与图谱共用同一套依据字段，才能打开原文对照原 PDF。"""
+    doc = documents_map.get(unit.document_id or "")
+    original = document_original_text(doc) if doc else ""
+    quote = unit.source_span or unit.content
+    meta = attach_image_refs(unit.document_id, unit.unit_meta)
+    doc_title = ""
+    if doc:
+        doc_title = str((doc.index_meta or {}).get("title") or doc.filename)
+    return {
+        "id": unit.id,
+        "unit_id": unit.id,
+        "title": unit.title,
+        "role": unit.semantic_role,
+        "semantic_role": unit.semantic_role,
+        "lifecycle": unit.lifecycle,
+        "filename": doc.filename if doc else "",
+        "document_id": unit.document_id,
+        "document_title": doc_title or (doc.filename if doc else "未关联文档"),
+        "chapter": unit.source_chapter,
+        "section": unit.source_section,
+        "page": unit.source_page,
+        "source_chapter": unit.source_chapter,
+        "source_page": unit.source_page,
+        "quote": quote,
+        "original": _snippet_window(original, quote) if original else quote,
+        "content": unit.content,
+        "image_key": meta.get("image_key") or "",
+        "image_url": meta.get("image_url") or "",
+    }
 
 
 @router.get("/{kb_id}/catalog")
@@ -115,6 +154,14 @@ async def catalog(kb_id: str, session: AsyncSession = Depends(get_session)):
         select(KnowledgeCatalog).where(KnowledgeCatalog.kb_id == kb_id).order_by(KnowledgeCatalog.level, KnowledgeCatalog.path)
     )
     nodes = result.scalars().all()
+    unit_count = int(await session.scalar(select(func.count(KnowledgeUnit.id)).where(KnowledgeUnit.kb_id == kb_id)) or 0)
+    if catalog_needs_rebuild(nodes, unit_count):
+        await sync_catalog_for_kb(session, kb_id)
+        await session.commit()
+        result = await session.execute(
+            select(KnowledgeCatalog).where(KnowledgeCatalog.kb_id == kb_id).order_by(KnowledgeCatalog.level, KnowledgeCatalog.path)
+        )
+        nodes = result.scalars().all()
     parents = {n.parent_id for n in nodes if n.parent_id}
     return [_catalog_item(n, parents) for n in nodes]
 
@@ -143,43 +190,55 @@ async def catalog_node(kb_id: str, node_id: str, session: AsyncSession = Depends
     documents_map: dict[str, Document] = {}
     quotes: list[dict] = []
     if is_leaf:
-        all_units = (
-            await session.execute(select(KnowledgeUnit).where(KnowledgeUnit.kb_id == kb_id))
-        ).scalars().all()
-        units = [unit for unit in all_units if _unit_matches_node(unit, node)]
-        doc_ids = [unit.document_id for unit in units if unit.document_id]
-        if doc_ids:
-            docs = (
-                await session.execute(select(Document).where(Document.id.in_(doc_ids)))
+        tagged = unit_id_from_related(node.related_concepts)
+        if tagged:
+            unit = await session.get(KnowledgeUnit, tagged)
+            units = [unit] if unit and unit.kb_id == kb_id else []
+        else:
+            all_units = (
+                await session.execute(select(KnowledgeUnit).where(KnowledgeUnit.kb_id == kb_id))
             ).scalars().all()
-            documents_map = {doc.id: doc for doc in docs}
-        for unit in units:
-            doc = documents_map.get(unit.document_id or "")
-            original = document_original_text(doc) if doc else ""
-            quote = unit.source_span or unit.content
-            quotes.append(
-                {
-                    "unit_id": unit.id,
-                    "title": unit.title,
-                    "semantic_role": unit.semantic_role,
-                    "filename": doc.filename if doc else "",
-                    "document_id": unit.document_id,
-                    "source_chapter": unit.source_chapter,
-                    "source_page": unit.source_page,
-                    "quote": quote,
-                    "original": _snippet_window(original, quote) if original else quote,
-                }
+            units = [unit for unit in all_units if _unit_matches_node(unit, node)]
+    else:
+        # 章节/文章节点：汇总下属知识点，右侧详情才能像图谱一样直接看依据
+        descendants = (
+            await session.execute(
+                select(KnowledgeCatalog).where(
+                    KnowledgeCatalog.kb_id == kb_id,
+                    KnowledgeCatalog.path.like(_descendant_path_pattern(node.path), escape="\\"),
+                )
             )
+        ).scalars().all()
+        unit_ids = [unit_id_from_related(item.related_concepts) for item in descendants]
+        unit_ids = [uid for uid in unit_ids if uid]
+        if unit_ids:
+            units = (
+                await session.execute(select(KnowledgeUnit).where(KnowledgeUnit.id.in_(unit_ids)))
+            ).scalars().all()
+    doc_ids = [unit.document_id for unit in units if unit.document_id]
+    if doc_ids:
+        docs = (
+            await session.execute(select(Document).where(Document.id.in_(doc_ids)))
+        ).scalars().all()
+        documents_map = {doc.id: doc for doc in docs}
+    quotes = [_quote_from_unit(unit, documents_map) for unit in units]
+
+    visible_related = public_related(node.related_concepts)
+    if is_leaf and units:
+        overview = (units[0].content or "")[:500] or f"知识点：{node.name}"
+    elif children:
+        overview = f"「{node.name}」下有 {len(children)} 个{'知识点' if all(unit_id_from_related(child.related_concepts) for child in children) else '章节/条目'}。"
+    else:
+        overview = f"文章「{node.name}」，按章节展开查看抽取的知识点。"
+    if visible_related and not is_leaf:
+        overview += f" 标签：{'、'.join(visible_related[:8])}。"
 
     return {
         **_catalog_item(node),
         "is_leaf": is_leaf,
         "breadcrumb": crumbs,
         "children": [_catalog_item(child) for child in children],
-        "overview": (
-            f"{node.name} 是知识目录中的主题节点。"
-            + (f"关联概念：{', '.join(node.related_concepts)}。" if node.related_concepts else "")
-        ),
+        "overview": overview,
         "quotes": quotes,
         "documents": [
             {"id": doc.id, "filename": doc.filename, "status": doc.status}

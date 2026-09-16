@@ -5,11 +5,20 @@ from typing import Iterable
 
 from app.domain.enums import KnowledgeType, SemanticRole
 from app.domain.strategy import DocumentContext, KnowledgeUnitDraft
+from app.observability.pipeline_log import draft_digest, step as pipeline_step
 
 ROLE_HINTS: list[tuple[SemanticRole, tuple[str, ...]]] = [
     (SemanticRole.DEFINITION, ("定义", "definition", "是指", "refers to", "什么是")),
-    (SemanticRole.PRINCIPLE, ("原理", "principle", "mechanism", "机制", "why")),
-    (SemanticRole.FORMULA, ("公式", "formula", "mtbf", "tsu", "th")),
+    (SemanticRole.PRINCIPLE, ("原理", "principle", "mechanism", "机制", "architecture", "why")),
+    (SemanticRole.FORMULA, ("公式", "formula", "equation", "mtbf", "tsu", "th", "snr =", "enob")),
+    (SemanticRole.METRIC, ("sndr", "enob", "ber", "gb/s", "mw", "fom", "measurement", "measured")),
+    (SemanticRole.PARAMETER, ("parameter", "resolution", "sampling", "tap", "nm cmos", "supply")),
+    (SemanticRole.COMPARISON, ("compared with", "comparison", "versus", "relative to prior")),
+    (SemanticRole.LIMITATION, ("limitation", "drawback", "however", "at the cost")),
+    (SemanticRole.INTERFACE, ("interface", "block diagram", "front-end", "clock path")),
+    (SemanticRole.SUMMARY, ("abstract", "in this paper", "this work", "conclusion")),
+    (SemanticRole.BACKGROUND, ("introduction", "previous work", "prior art")),
+    (SemanticRole.REFERENCE, ("references", "et al", "[1]", "ieee jssc")),
     (SemanticRole.CONSTRAINT, ("约束", "constraint", "must", "shall", "禁止", "必须")),
     (SemanticRole.RULE, ("规则", "rule", "design rule")),
     (SemanticRole.EXAMPLE, ("例如", "example", "示例", "for example")),
@@ -41,10 +50,12 @@ def extract_units_from_text(
     pages = context.structure.get("pages") or [{"page": 1, "text": context.text}]
     drafts: list[KnowledgeUnitDraft] = []
     parent_stack: list[str] = [context.filename]
+    split_rules: list[str] = []
 
     for page in pages:
         page_no = int(page.get("page") or 1)
-        blocks = _split_blocks(page.get("text") or "")
+        blocks, rule = _split_blocks(page.get("text") or "")
+        split_rules.append(rule)
         for block in blocks:
             heading = _first_line(block)
             role = _infer_role(block, allowed)
@@ -74,23 +85,42 @@ def extract_units_from_text(
                     confidence=0.78 if role != SemanticRole.EXPLANATION else 0.7,
                 )
             )
-    return drafts or [
-        KnowledgeUnitDraft(
-            title=context.filename,
-            content=context.text[:2000],
-            semantic_role=SemanticRole.DEFINITION,
-            knowledge_type=knowledge_type,
-            source_span=context.text[:500],
-            parent_context=context.filename,
-        )
-    ]
+    if not drafts:
+        drafts = [
+            KnowledgeUnitDraft(
+                title=context.filename,
+                content=context.text[:2000],
+                semantic_role=SemanticRole.DEFINITION,
+                knowledge_type=knowledge_type,
+                source_span=context.text[:500],
+                parent_context=context.filename,
+            )
+        ]
+        split_rules.append("whole_document_fallback")
+    pipeline_step(
+        "ingest",
+        "chunk",
+        inputs={
+            "filename": context.filename,
+            "knowledge_type": knowledge_type.value,
+            "pages": len(pages),
+            "text_len": len(context.text or ""),
+        },
+        result={
+            "rule": _dominant_split_rule(split_rules),
+            "page_rules": split_rules[:8],
+            **draft_digest(drafts),
+        },
+    )
+    return drafts
 
 
-def _split_blocks(text: str) -> list[str]:
+def _split_blocks(text: str) -> tuple[list[str], str]:
+    """先按空行切块；没有合格段落时再按句攒到约 180 字。返回 (块, 规则名)。"""
     parts = re.split(r"\n\s*\n+", text)
-    blocks = [p.strip() for p in parts if len(p.strip()) > 40]
-    if blocks:
-        return blocks
+    blocks = [p.strip() for p in parts if p.strip()]
+    if len(parts) > 1 and blocks:
+        return blocks, "blank_line"
     sentences = re.split(r"(?<=[。.!?\n])", text)
     chunk: list[str] = []
     buf = ""
@@ -101,7 +131,15 @@ def _split_blocks(text: str) -> list[str]:
             buf = ""
     if buf.strip():
         chunk.append(buf.strip())
-    return chunk
+    return chunk, "sentence_~180"
+
+
+def _dominant_split_rule(rules: list[str]) -> str:
+    if not rules:
+        return "none"
+    if all(rule == rules[0] for rule in rules):
+        return rules[0]
+    return "mixed:" + ",".join(sorted(set(rules)))
 
 
 def _infer_role(text: str, allowed: set[SemanticRole]) -> SemanticRole:
@@ -119,7 +157,9 @@ def _infer_role(text: str, allowed: set[SemanticRole]) -> SemanticRole:
 def _extract_concepts(text: str) -> list[str]:
     patterns = [
         r"\b(CDC|MTBF|FIFO|RTL|FSM|ATPG|MBIST|PCIe|DDR\d|Setup Time|Hold Time|Metastability|Synchronizer|Gray Code)\b",
-        r"(亚稳态|同步器|建立时间|保持时间|跨时钟域)",
+        r"\b(ADC|SAR|TI-ADC|FFE|DFE|CTLE|CDR|ENOB|SNDR|SFDR|FoM|BER|NRZ|PAM-4|SerDes|AFE)\b",
+        r"\b(time[- ]interleaving|embedded equalization|hybrid ADC|decision feedback|feed-forward)\b",
+        r"(亚稳态|同步器|建立时间|保持时间|跨时钟域|均衡器|模数转换)",
     ]
     found: list[str] = []
     for pattern in patterns:

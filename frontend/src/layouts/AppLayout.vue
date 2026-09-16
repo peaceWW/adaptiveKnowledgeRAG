@@ -5,14 +5,11 @@
       <a-input-search
         v-model:value="keyword"
         class="search"
-        placeholder="搜索知识库、文档、知识单元..."
+        placeholder="搜索知识库名称、领域、描述…"
         allow-clear
         @search="onSearch"
       />
-      <a-space :size="16">
-        <a-badge dot>
-          <span class="header-icon">🔔</span>
-        </a-badge>
+      <a-space :size="16" class="account">
         <span class="header-icon" title="最近问答" @click="$router.push({ name: 'chat' })">🕒</span>
         <a-select :value="session.username" style="width: 200px" @change="onUser">
           <a-select-option value="alice">Alice · 普通用户</a-select-option>
@@ -23,7 +20,7 @@
       </a-space>
     </a-layout-header>
     <a-layout>
-      <a-layout-sider theme="light" width="220">
+      <a-layout-sider theme="light" :width="220" breakpoint="lg" :collapsed-width="0" class="sidebar">
         <a-menu
           :selected-keys="[String(route.name)]"
           :open-keys="openKeys"
@@ -119,9 +116,18 @@ function onSearch(value: string) {
   font-size: 16px;
 }
 .content {
+  min-width: 0;
   margin: 0;
   padding: 20px 24px 32px;
   background: #f4f6fb;
   min-height: calc(100vh - 64px);
+}
+.account { margin-left: auto; }
+.content :deep(> div) { width: 100%; max-width: none; }
+.sidebar { border-right: 1px solid #e6ebf2; }
+@media (max-width: 760px) {
+  .header { height: auto; min-height: 64px; flex-wrap: wrap; gap: 12px; padding: 12px 16px; line-height: normal; }
+  .search { order: 3; flex-basis: 100%; max-width: none; }
+  .content { padding: 20px 16px; }
 }
 </style>

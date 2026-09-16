@@ -41,7 +41,7 @@
 - 后端：Python 3.12+ / FastAPI / LangGraph / SQLAlchemy
 - 前端：Vue 3 / Vite / Ant Design Vue
 - 可选基础设施：Postgres、Redis、Qdrant、MinIO、Elasticsearch、Neo4j（见 `docker-compose.yml`）
-- 模型：OpenAI 兼容网关；未配置 `MODEL_API_KEY` 时走启发式，不阻塞本地演示
+- 模型：OpenAI 兼容网关（推荐 DashScope 接入千问）；未配置 `MODEL_API_KEY` 时走启发式，不阻塞本地演示
 
 ## 目录结构
 
@@ -88,7 +88,7 @@ AdaptiveKnowledgeRAG/
 - Python **3.12+** 与 [uv](https://docs.astral.sh/uv/)
 - Node.js **18+**（含 npm）
 - 可选：Docker / Docker Compose（完整中间件）
-- 可选：`MODEL_API_KEY`（真实 LLM；留空亦可运行）
+- 可选：`MODEL_API_KEY`（真实 LLM；留空亦可运行。千问示例见下方配置）
 
 ## 一键部署与启停
 
@@ -186,7 +186,7 @@ cd frontend && npm install && cd ..
 docker compose up -d
 
 # 后端（在仓库根目录执行，以便读取 .env 与 data/）
-uv run uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000
+uv run uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port 8000
 
 # 前端
 cd frontend && npm run dev
@@ -198,7 +198,7 @@ cd frontend && npm run dev
 | --- | --- |
 | Postgres | 自动改用 `data/akrag.db`（SQLite） |
 | Qdrant | 进程内向量 |
-| MinIO | 内存/本地对象 |
+| MinIO | 磁盘 `data/storage`（MinIO 可用时再多写一份） |
 | Elasticsearch | 本地关键字索引 + SQL 回退 |
 | Neo4j | 图谱能力降级 |
 | `MODEL_API_KEY` | 启发式分类/抽取/问答 |
@@ -211,16 +211,26 @@ cd frontend && npm run dev
 DATABASE_URL=postgresql+asyncpg://akrag:akrag@localhost:5432/akrag
 # 或 sqlite+aiosqlite:///./data/akrag.db
 
-MODEL_BASE_URL=https://api.openai.com/v1
+# 推荐：DashScope compatible-mode 接入千问（走现有 OpenAI 协议网关，无需另装 SDK）
+MODEL_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 MODEL_API_KEY=
-MODEL_LLM=gpt-4o-mini
-MODEL_EMBEDDING=text-embedding-3-small
+MODEL_LLM=qwen-plus
+MODEL_VISION=qwen-vl-plus
+MODEL_EMBEDDING=text-embedding-v3
+EMBEDDING_DIM=1024
 
 QDRANT_URL=http://localhost:6333
 ELASTICSEARCH_URL=http://localhost:9200
 NEO4J_URI=bolt://localhost:7687
 MINIO_ENDPOINT=localhost:9000
+STORAGE_DIR=data/storage
 ```
+
+`EMBEDDING_DIM` 必须与 embedding 模型输出维一致（千问 `text-embedding-v3` 默认 1024）。换维后需要重建 Qdrant collection（删除已有 `knowledge_units` 或更换 `QDRANT_COLLECTION`），否则向量写入会失败。千问 embedding 单次最多 10 条，网关按 `EMBEDDING_BATCH_SIZE`（默认 10）切批；超过限制会整批失败并退回 hash 向量。图/公式的 Vision 调用使用 `MODEL_VISION`，留空则回退到 `MODEL_LLM`。
+
+上传的原文保存在 `STORAGE_DIR/originals/{知识库id}/{文档id}/`，抽取的图/公式/表 PNG 在 `STORAGE_DIR/images/{文档id}/`。知识单元带 `image_url`（`/api/documents/{id}/assets?key=...`），问答与审核页用该地址引用图片，不再只有文件名。已入库文档需重新抽取后才会写入新的 `image_url` 与磁盘截图。
+
+仍可把 `MODEL_BASE_URL` 指到任何 OpenAI 兼容端点。无 `MODEL_API_KEY` 时分类、抽取与问答走启发式，不阻塞本地演示。
 
 `docker-compose.yml` 默认账号与示例环境变量一致（Postgres `akrag/akrag`，MinIO `minioadmin`，Neo4j `neo4j/akrag-neo4j`）。
 

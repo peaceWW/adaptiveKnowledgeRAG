@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from app.domain.strategy import CompletenessResult, QueryContext
 from app.model_gateway.gateway import ModelGateway
+from app.prompts.loader import load_prompt
+
+DEFAULT_PROMPT = """你是芯片设计工程师，检查检索覆盖。不得补知识。输出 JSON：
+{"required_knowledge":[],"covered":[],"missing":[],"completeness_score":0.0,"need_secondary_retrieval":false,"secondary_query":""}
+"""
 
 
 class CompletenessChecker:
@@ -17,10 +22,7 @@ class CompletenessChecker:
         threshold: float = 0.8,
     ) -> CompletenessResult:
         llm = self.gateway.chat_json(
-            """你不是回答生成器。判断当前检索结果是否足以完整回答用户问题。
-输出 JSON：
-{"required_knowledge":[],"covered":[],"missing":[],"completeness_score":0.0,"need_secondary_retrieval":false,"secondary_query":""}
-不得自行补充知识。""",
+            load_prompt("completeness-checker", DEFAULT_PROMPT),
             str(
                 {
                     "query": query.query,

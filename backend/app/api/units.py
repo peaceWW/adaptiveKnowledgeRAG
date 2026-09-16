@@ -5,8 +5,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.schemas import BatchReviewAction, ReviewAction
 from app.deps import get_stores
 from app.domain.enums import KnowledgeLifecycle
+from app.domain.payload import unit_vector_payload
 from app.storage.db import get_session
 from app.storage.models import Document, KnowledgeUnit, ReviewTask
+from app.storage.paths import attach_image_refs
 
 router = APIRouter(prefix="/knowledge-units", tags=["knowledge-units"])
 
@@ -60,22 +62,7 @@ def apply_unit_review(
         raise HTTPException(400, "unknown action")
     if unit.lifecycle == KnowledgeLifecycle.PUBLISHED.value:
         vector = stores.gateway.embed([f"{unit.title}\n{unit.content}"])[0]
-        stores.qdrant.upsert(
-            unit.id,
-            vector,
-            {
-                "kb_id": unit.kb_id,
-                "knowledge_type": unit.knowledge_type,
-                "semantic_role": unit.semantic_role,
-                "domain": unit.domain,
-                "concept_ids": unit.concepts,
-                "source_level": unit.source_level,
-                "lifecycle": unit.lifecycle,
-                "version": unit.version,
-                "title": unit.title,
-                "content": unit.content[:2000],
-            },
-        )
+        stores.qdrant.upsert(unit.id, vector, unit_vector_payload(unit))
 
 
 async def _close_review_tasks(session: AsyncSession, unit_id: str, comment: str) -> None:
@@ -223,6 +210,8 @@ def _serialize(unit: KnowledgeUnit) -> dict:
         "source_section": unit.source_section,
         "source_page": unit.source_page,
         "source_span": unit.source_span,
+        "unit_meta": attach_image_refs(unit.document_id, unit.unit_meta),
+        "parent_id": unit.parent_id,
         "version": unit.version,
         "confidence": unit.confidence,
         "lifecycle": unit.lifecycle,

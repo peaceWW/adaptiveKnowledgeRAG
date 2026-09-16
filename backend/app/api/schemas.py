@@ -1,4 +1,6 @@
+from typing import Literal
 from pydantic import BaseModel, Field
+from app.domain.extraction_policy import ExtractionPolicy
 
 
 class CatalogNodeCreate(BaseModel):
@@ -18,13 +20,14 @@ class KnowledgeBaseCreate(BaseModel):
 
 
 class StrategyCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=200)
     knowledge_type: str = "technical_concept"
     version: str = "V1"
-    chunk_policy: str = "semantic_unit"
+    chunk_policy: Literal["semantic_unit", "section", "fixed_token"] | None = None
     roles: list[str] = Field(default_factory=list)
     clone_id: str | None = None
     completeness_policy: dict | None = None
+    extraction_policy: ExtractionPolicy | None = None
 
 
 class KnowledgeRoleCreate(BaseModel):
@@ -42,13 +45,14 @@ class StrategyPreviewRequest(BaseModel):
 
 
 class StrategyUpdate(BaseModel):
-    name: str | None = None
+    name: str | None = Field(None, min_length=1, max_length=200)
     roles: list[str] | None = None
-    chunk_policy: str | None = None
+    chunk_policy: Literal["semantic_unit", "section", "fixed_token"] | None = None
     max_context_tokens: int | None = None
     retrieval_policy: dict | None = None
     completeness_policy: dict | None = None
     relation_schema: dict | None = None
+    extraction_policy: ExtractionPolicy | None = None
 
 
 class ReviewAction(BaseModel):

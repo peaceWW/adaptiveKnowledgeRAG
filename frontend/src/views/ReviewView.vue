@@ -62,7 +62,7 @@
           >
             <span class="idx">{{ index + 1 }}</span>
             <div class="unit-meta">
-              <div class="unit-title">{{ item.title }}</div>
+              <div class="unit-title" :title="item.title">{{ item.title }}</div>
               <div class="unit-tags">
                 <a-tag :color="roleColor(item.semantic_role)">{{ roleLabel(item.semantic_role) }}</a-tag>
                 <span class="conf">{{ percent(item.confidence) }}%</span>
@@ -75,21 +75,39 @@
 
       <section class="pane source-pane">
         <div class="pane-head">
-          <div class="pane-title">原文内容</div>
+          <div class="pane-title">原文对照 <span v-if="selecting" class="muted">正在加载知识点…</span></div>
           <div class="pager">
-            <a-button size="small" :disabled="!hasPrev" @click="goRelative(-1)">‹</a-button>
-            <span>{{ currentIndex + 1 }} / {{ filteredUnits.length || 0 }}</span>
-            <a-button size="small" :disabled="!hasNext" @click="goRelative(1)">›</a-button>
+            <a-button size="small" :disabled="!hasPrev" aria-label="上一条知识点" @click="goRelative(-1)">‹</a-button>
+            <span>知识点 {{ currentIndex + 1 }} / {{ filteredUnits.length || 0 }}</span>
+            <a-button size="small" :disabled="!hasNext" aria-label="下一条知识点" @click="goRelative(1)">›</a-button>
           </div>
         </div>
-        <div v-if="detail" ref="sourceBox" class="source-body">
-          <span v-for="(part, index) in highlightParts" :key="index" :class="{ hit: part.hit }">{{ part.text }}</span>
+        <div v-if="documentId" class="source-tabs">
+          <a-radio-group v-model:value="sourceMode" size="small" button-style="solid">
+            <a-radio-button v-if="isPdf" value="pdf">PDF 原稿</a-radio-button>
+            <a-radio-button v-for="item in extractionTabs" :key="item.key" :value="item.key">{{ item.label }} <span class="tab-count">{{ item.count }}</span></a-radio-button>
+          </a-radio-group>
         </div>
-        <a-empty v-else description="请从左侧选择一条知识点" />
+        <div class="extraction-context">
+          <template v-if="extractionInfo?.strategy_snapshot">
+            抽取快照：{{ strategyLabel(extractionInfo.strategy_snapshot.name) }} · {{ chunkLabels[extractionInfo.strategy_snapshot.chunk_policy] }}
+            <span>（以当时配置为准）</span>
+            <div class="snapshot-flags">
+              <a-tag v-for="item in extractionTabs" :key="item.key" :color="item.enabled ? 'blue' : 'default'">{{ item.label }} {{ item.enabled ? item.count : '关闭' }}</a-tag>
+            </div>
+          </template>
+          <template v-else>历史提取结果 · 未记录策略快照，按现有知识单元分类展示</template>
+        </div>
+        <PdfSourceViewer v-if="documentId && isPdf" v-show="sourceMode === 'pdf'"
+          :key="documentId" :document-id="documentId" :filename="sourceFilename"
+          :source-page="detail?.source_page" :source-key="detail?.id || documentId" @show-text="sourceMode = 'text'" />
+        <ExtractionResults v-if="documentId && sourceMode !== 'pdf'" :document-id="documentId" :units="units" :kind="sourceMode"
+          :selected-id="currentId" :enabled="activeExtractionTab?.enabled" :custom-labels="customRoleLabels" @select="select" @locate="locateResult" />
       </section>
 
       <section class="pane form-pane">
         <template v-if="detail">
+          <div class="pane-title form-title">知识单元 <span class="muted">抽取结果与审核</span></div>
           <a-form layout="vertical">
             <a-form-item label="类型">
               <a-select v-model:value="form.semantic_role" :disabled="!editing">
@@ -109,19 +127,24 @@
             </a-form-item>
             <a-form-item label="重要性">
               <a-select v-model:value="form.importance" :disabled="!editing">
-                <a-select-option value="high">High</a-select-option>
-                <a-select-option value="medium">Medium</a-select-option>
-                <a-select-option value="low">Low</a-select-option>
+                <a-select-option value="high">高</a-select-option>
+                <a-select-option value="medium">中</a-select-option>
+                <a-select-option value="low">低</a-select-option>
               </a-select>
             </a-form-item>
-            <a-form-item label="内容">
+            <a-form-item label="知识内容（抽取结果）">
               <a-textarea v-model:value="form.content" :rows="10" :disabled="!editing" />
+            </a-form-item>
+            <a-form-item v-if="assetUrl" label="图 / 公式截图">
+              <img :src="assetUrl" class="asset-img" alt="unit asset" />
+              <div v-if="detail?.unit_meta?.image_url" class="muted">图片地址 {{ detail.unit_meta.image_url }}</div>
+              <div class="muted">{{ detail?.unit_meta?.caption || detail?.unit_meta?.latex || detail?.unit_meta?.anchor }}</div>
             </a-form-item>
           </a-form>
           <div class="actions">
-            <a-button :auto-insert-space="false" @click="review('reject', true)">拒绝</a-button>
-            <a-button :auto-insert-space="false" @click="toggleEdit">{{ editing ? "保存" : "编辑" }}</a-button>
-            <a-button type="primary" :auto-insert-space="false" @click="review('accept', true)">通过并下一个</a-button>
+            <a-button :disabled="selecting" :auto-insert-space="false" @click="review('reject', true)">拒绝</a-button>
+            <a-button :disabled="selecting" :auto-insert-space="false" @click="toggleEdit">{{ editing ? "保存" : "编辑" }}</a-button>
+            <a-button :disabled="selecting" type="primary" :auto-insert-space="false" @click="review('accept', true)">通过并下一个</a-button>
           </div>
         </template>
         <a-empty v-else description="选择左侧知识单元后开始审核" />
@@ -131,19 +154,17 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onBeforeUnmount, reactive, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 import { message } from "ant-design-vue";
 import { api } from "../api";
+import PdfSourceViewer from '../components/PdfSourceViewer.vue';
+import ExtractionResults from '../components/ExtractionResults.vue';
+import { extractionCategories, extractionKind, roleLabels, chunkLabels, strategyLabel } from '../knowledge';
 
 const PENDING = new Set(["DRAFT", "AI_PROCESSED", "PENDING_REVIEW", "APPROVED"]);
 const REVIEWED = new Set(["PUBLISHED", "ARCHIVED", "DEPRECATED"]);
-const roleOptions = [
-  "definition", "principle", "constraint", "rule", "example", "explanation",
-  "formula", "parameter", "exception", "solution", "classification", "reference",
-  "related_concept", "environment", "symptom", "root_cause", "prevention", "impact",
-  "api_input", "api_output", "error_code",
-];
+const roleOptions = Object.keys(roleLabels);
 const roleColors: Record<string, string> = {
   definition: "green",
   principle: "blue",
@@ -170,6 +191,18 @@ const roleFilter = ref("");
 const editing = ref(false);
 const batching = ref(false);
 const sourceBox = ref<HTMLElement | null>(null);
+const assetUrl = ref("");
+const sourceMode = ref('pdf');
+const extractionInfo = ref<any>(null);
+const sourceFilename = computed(() => detail.value?.filename || documents.value.find(doc => doc.id === documentId.value)?.filename || '');
+const customRoleLabels = computed<Record<string, string>>(() => Object.fromEntries((extractionInfo.value?.strategy_snapshot?.role_rules || []).map((rule: any) => [rule.key, roleLabels[rule.key] || rule.label])));
+const extractionTabs = computed(() => extractionInfo.value?.categories || extractionCategories.map(item => ({ ...item, count: units.value.filter(unit => extractionKind(unit) === item.key).length, enabled: null })));
+const activeExtractionTab = computed(() => extractionTabs.value.find((item: any) => item.key === sourceMode.value));
+const selecting = ref(false);
+let selectionVersion = 0;
+let unitLoadVersion = 0;
+const isPdf = computed(() => sourceFilename.value.toLowerCase().endsWith('.pdf'));
+watch(isPdf, value => { sourceMode.value = value ? 'pdf' : 'text'; });
 const form = reactive({
   title: "",
   semantic_role: "definition",
@@ -203,14 +236,13 @@ const hasPrev = computed(() => currentIndex.value > 0);
 const hasNext = computed(() => currentIndex.value >= 0 && currentIndex.value < filteredUnits.value.length - 1);
 const highlightParts = computed(() =>
   splitHighlight(
-    detail.value?.original_text || detail.value?.source_text || detail.value?.source_span || detail.value?.content || "",
+    detail.value?.source_text || detail.value?.source_span || detail.value?.original_text || detail.value?.content || "",
     detail.value,
   ),
 );
 
 function roleLabel(role = "") {
-  if (!role) return "";
-  return role.replace(/_/g, " ").replace(/\b\w/g, (ch) => ch.toUpperCase());
+  return roleLabels[role] || customRoleLabels.value[role] || role;
 }
 function roleColor(role = "") {
   return roleColors[role] || "default";
@@ -274,16 +306,16 @@ async function loadDocuments() {
 }
 
 async function loadUnits(keepId?: string, autoSelect = true) {
+  const request = ++unitLoadVersion;
   if (!documentId.value) {
     units.value = [];
     detail.value = null;
     return;
   }
-  units.value = (
-    await api.get("/knowledge-units", {
-      params: { document_id: documentId.value, enabled_only: true },
-    })
-  ).data;
+  const extraction = (await api.get(`/documents/${documentId.value}/extractions`)).data;
+  if (request !== unitLoadVersion) return;
+  extractionInfo.value = extraction;
+  units.value = extraction.units;
   if (!autoSelect) return;
   const nextId =
     (keepId && units.value.some((item: any) => item.id === keepId) && keepId) ||
@@ -293,28 +325,70 @@ async function loadUnits(keepId?: string, autoSelect = true) {
   else detail.value = null;
 }
 
-function onDocumentChange() {
+async function onDocumentChange() {
+  selectionVersion++;
   currentId.value = undefined;
-  loadUnits();
+  detail.value = null;
+  extractionInfo.value = null;
+  units.value = [];
+  keyword.value = '';
+  roleFilter.value = '';
+  await loadUnits();
 }
 
 async function select(id: string) {
+  const request = ++selectionVersion;
   currentId.value = id;
   editing.value = false;
-  detail.value = (await api.get(`/knowledge-units/${id}`)).data;
+  selecting.value = true;
+  try {
+  const { data } = await api.get(`/knowledge-units/${id}`);
+  if (request !== selectionVersion) return;
+  detail.value = data;
   form.title = detail.value.title;
   form.semantic_role = detail.value.semantic_role;
   form.importance = toImportance(detail.value.importance);
   form.content = detail.value.content;
   form.confidence = percent(detail.value.confidence);
+  await loadAsset(detail.value);
   await nextTick();
   const hit = sourceBox.value?.querySelector(".hit");
-  hit?.scrollIntoView({ block: "center" });
+  if (sourceMode.value === 'text') hit?.scrollIntoView({ block: "center" });
+  } catch {
+    if (request === selectionVersion) detail.value = null;
+  } finally { if (request === selectionVersion) selecting.value = false; }
+}
+
+function revokeAsset() {
+  if (assetUrl.value.startsWith("blob:")) URL.revokeObjectURL(assetUrl.value);
+  assetUrl.value = "";
+}
+
+async function loadAsset(unit: any) {
+  revokeAsset();
+  const key = unit?.unit_meta?.image_key;
+  const docId = unit?.document_id || documentId.value;
+  if (unit?.unit_meta?.image_url) {
+    assetUrl.value = unit.unit_meta.image_url;
+    return;
+  }
+  if (!key || !docId) return;
+  try {
+    const res = await api.get(`/documents/${docId}/assets`, { params: { key }, responseType: "blob" });
+    if (currentId.value !== unit.id) return;
+    assetUrl.value = URL.createObjectURL(res.data);
+  } catch {
+    assetUrl.value = "";
+  }
 }
 
 function goRelative(step: number) {
   const next = filteredUnits.value[currentIndex.value + step];
   if (next) select(next.id);
+}
+async function locateResult(id: string) {
+  await select(id);
+  if (detail.value?.id === id) sourceMode.value = isPdf.value ? 'pdf' : 'text';
 }
 
 async function toggleEdit() {
@@ -363,7 +437,7 @@ watch(
   async (value) => {
     if (value && String(value) !== documentId.value) {
       await loadDocuments();
-      await loadUnits();
+      await onDocumentChange();
     }
   },
 );
@@ -372,10 +446,15 @@ onMounted(async () => {
   await loadDocuments();
   await loadUnits();
 });
+onBeforeUnmount(() => {
+  selectionVersion++;
+  unitLoadVersion++;
+  revokeAsset();
+});
 </script>
 
 <style scoped>
-.review-page { max-width: 1440px; }
+.review-page { width: 100%; min-width: 0; }
 .stats-bar {
   display: flex;
   align-items: center;
@@ -394,15 +473,17 @@ onMounted(async () => {
 .metric .pass { color: #2563eb; }
 .workspace {
   display: grid;
-  grid-template-columns: 280px minmax(0, 1fr) 340px;
+  grid-template-columns: 250px minmax(0, 1fr) 320px;
   gap: 12px;
-  min-height: calc(100vh - 180px);
+  height: calc(100dvh - 168px);
+  min-height: 620px;
 }
 .pane {
   background: #fff;
   border-radius: 12px;
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
   min-height: 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
 }
@@ -412,6 +493,14 @@ onMounted(async () => {
 .list-tools { display: grid; grid-template-columns: 1fr 110px; gap: 8px; margin: 12px 0; }
 .role-filter { width: 100%; }
 .unit-list { overflow: auto; flex: 1; }
+.unit-meta { flex: 1; min-width: 0; }
+.source-tabs { padding: 0 0 12px; }
+.source-tabs :deep(.ant-radio-group) { display: flex; flex-wrap: wrap; gap: 6px; }
+.tab-count { margin-left: 4px; font-size: 11px; }
+.extraction-context { color: #64748b; font-size: 12px; padding-bottom: 12px; }
+.snapshot-flags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.form-title { margin-bottom: 18px; }
+.text-notice { color: #64748b; background: #f1f5f9; border-radius: 6px; padding: 12px; margin-bottom: 16px; font-size: 12px; white-space: normal; }
 .unit-item {
   width: 100%;
   border: 0;
@@ -437,7 +526,7 @@ onMounted(async () => {
 }
 .unit-tags { display: flex; align-items: center; gap: 8px; }
 .conf { color: #6b7280; font-size: 12px; }
-.source-pane { padding: 14px; }
+.source-pane { padding: 14px; overflow: hidden; }
 .pager { display: flex; align-items: center; gap: 8px; color: #6b7280; }
 .pane-head { display: flex; justify-content: space-between; align-items: center; padding: 0 0 10px; }
 .source-body {
@@ -447,17 +536,33 @@ onMounted(async () => {
   line-height: 1.7;
   color: #374151;
   padding-right: 4px;
+  overflow-wrap: anywhere;
 }
 .hit {
   background: #fecaca;
   border-radius: 4px;
   box-shadow: 0 0 0 4px #fecaca;
 }
-.form-pane { padding: 14px 16px 16px; }
+.form-pane { padding: 14px 16px 16px; overflow: auto; }
 .conf-row { display: grid; grid-template-columns: 1fr 48px; gap: 8px; align-items: center; }
-.actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+.actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+.asset-img { max-width: 100%; max-height: 220px; object-fit: contain; border: 1px solid #e5e7eb; border-radius: 8px; }
+.muted { color: #6b7280; font-size: 12px; margin-top: 6px; }
+@media (max-width: 1400px) {
+  .workspace { grid-template-columns: 220px minmax(0, 1fr) 280px; }
+  .list-tools { grid-template-columns: 1fr; }
+}
 @media (max-width: 1200px) {
-  .workspace { grid-template-columns: 1fr; }
-  .unit-list, .source-body { max-height: 360px; }
+  .workspace { grid-template-columns: 220px minmax(0, 1fr); height: auto; }
+  .source-pane, .list-pane { height: 780px; }
+  .form-pane { grid-column: 1 / -1; }
+}
+@media (max-width: 700px) {
+  .workspace { grid-template-columns: minmax(0, 1fr); }
+  .list-pane { height: 260px; }
+  .source-pane { height: 780px; padding: 10px; }
+  .stats-left { min-width: 0; flex-wrap: wrap; }
+  .doc-select { max-width: 100%; }
+  .pane-head { flex-wrap: wrap; gap: 8px; }
 }
 </style>

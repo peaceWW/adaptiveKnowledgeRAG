@@ -5,7 +5,7 @@ from app.domain.strategy import KnowledgeUnitDraft
 
 
 def validate_draft(draft: KnowledgeUnitDraft) -> tuple[KnowledgeLifecycle, bool]:
-    """Return lifecycle and whether a human review task is required."""
+    """决定入库生命周期：空内容保持 DRAFT；高风险进审核；其余 AI_PROCESSED 即可被问答检索。"""
     if not draft.content.strip() or not draft.source_span.strip():
         return KnowledgeLifecycle.DRAFT, True
     if draft.semantic_role in HIGH_RISK_ROLES:

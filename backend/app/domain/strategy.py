@@ -13,6 +13,10 @@ class DocumentContext:
     text: str
     structure: dict[str, Any] = field(default_factory=dict)
     classification: dict[str, Any] = field(default_factory=dict)
+    gateway: Any = None
+    raw: bytes | None = None
+    minio: Any = None
+    extraction_policy: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -30,6 +34,8 @@ class KnowledgeUnitDraft:
     parent_context: str = ""
     confidence: float = 0.8
     relations: list[dict[str, Any]] = field(default_factory=list)
+    unit_meta: dict[str, Any] = field(default_factory=dict)
+    source_level: str = ""
 
 
 @dataclass

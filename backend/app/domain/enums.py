@@ -109,6 +109,11 @@ class RelationType(StrEnum):
     HAS_EXAMPLE = "HAS_EXAMPLE"
     HAS_EXCEPTION = "HAS_EXCEPTION"
     AFFECTS = "AFFECTS"
+    BELONGS_TO = "BELONGS_TO"
+    ILLUSTRATES = "ILLUSTRATES"
+    HAS_FIGURE = "HAS_FIGURE"
+    HAS_EQUATION = "HAS_EQUATION"
+    HAS_TABLE = "HAS_TABLE"
 
 
 class UserRole(StrEnum):
@@ -137,28 +142,58 @@ HIGH_RISK_ROLES = {
     SemanticRole.EXCEPTION,
 }
 
+# 抽取完成后即可检索：AI_PROCESSED 未人工审核，但已有 source_span，不进问答会导致「全文能答、知识库没内容」。
+# 高风险仍停在 PENDING_REVIEW，不进入检索。
+RETRIEVAL_LIFECYCLES = {
+    KnowledgeLifecycle.PUBLISHED.value,
+    KnowledgeLifecycle.APPROVED.value,
+    KnowledgeLifecycle.AI_PROCESSED.value,
+}
+
 INTENT_ROLE_MAP: dict[QueryIntent, list[SemanticRole]] = {
     QueryIntent.DEFINITION: [
         SemanticRole.DEFINITION,
         SemanticRole.EXPLANATION,
+        SemanticRole.PRINCIPLE,
+        SemanticRole.INTERFACE,
+        SemanticRole.FORMULA,
     ],
     QueryIntent.CAUSE: [
         SemanticRole.DEFINITION,
         SemanticRole.ROOT_CAUSE,
         SemanticRole.PRINCIPLE,
         SemanticRole.SYMPTOM,
+        SemanticRole.CONSTRAINT,
+        SemanticRole.METRIC,
     ],
     QueryIntent.SOLUTION: [
         SemanticRole.CLASSIFICATION,
         SemanticRole.SOLUTION,
+        SemanticRole.PRINCIPLE,
         SemanticRole.CONSTRAINT,
+        SemanticRole.PARAMETER,
+        SemanticRole.INTERFACE,
         SemanticRole.EXAMPLE,
         SemanticRole.RULE,
+        SemanticRole.METRIC,
     ],
     QueryIntent.RISK: [
         SemanticRole.EXCEPTION,
         SemanticRole.CONSTRAINT,
         SemanticRole.ROOT_CAUSE,
         SemanticRole.PREVENTION,
+        SemanticRole.LIMITATION,
+        SemanticRole.RULE,
+        SemanticRole.METRIC,
+    ],
+    QueryIntent.COMPARISON: [
+        SemanticRole.COMPARISON,
+        SemanticRole.METRIC,
+        SemanticRole.PARAMETER,
+        SemanticRole.PRINCIPLE,
+        SemanticRole.INTERFACE,
+        SemanticRole.FORMULA,
+        SemanticRole.LIMITATION,
+        SemanticRole.REFERENCE,
     ],
 }

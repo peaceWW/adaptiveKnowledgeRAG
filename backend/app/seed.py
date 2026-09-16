@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import yaml
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,7 +15,9 @@ from app.domain.enums import (
     UserRole,
 )
 from app.domain.ontology import flatten_ontology
+from app.domain.extraction_policy import normalized_policy
 from app.model_gateway.gateway import ModelGateway
+from app.prompts.loader import apply_prompt_override, iter_prompt_files
 from app.storage.es_store import ElasticStore
 from app.storage.models import (
     Document,
@@ -34,8 +35,46 @@ from app.storage.models import (
 from app.storage.neo4j_store import Neo4jStore
 from app.storage.qdrant_store import QdrantStore
 
-PROMPT_DIR = Path(__file__).resolve().parents[1] / "prompts"
 FIXTURE_PATH = Path(__file__).resolve().parents[1] / "fixtures" / "cdc_design_guide.md"
+
+
+async def sync_prompt_templates(session: AsyncSession) -> None:
+    """把仓库芯片设计提示词写入模型中心表，并灌进运行时缓存。已有 prompt_id 则升级 content/version。"""
+    existing = {
+        item.prompt_id: item
+        for item in (await session.execute(select(PromptTemplate))).scalars().all()
+    }
+    for data in iter_prompt_files():
+        row = existing.get(data["prompt_id"])
+        if row is None:
+            row = PromptTemplate(
+                prompt_id=data["prompt_id"],
+                version=data["version"],
+                strategy=data["strategy"],
+                model=data["model"],
+                temperature=data["temperature"],
+                content=data["content"],
+                input_schema=data["input_schema"],
+                output_schema=data["output_schema"],
+                status="production",
+                success_rate=0.94,
+            )
+            session.add(row)
+            apply_prompt_override(data["prompt_id"], data["content"])
+            continue
+        # 版本升级才覆盖，避免重启冲掉模型中心里已保存的芯片设计微调
+        if row.version != data["version"]:
+            row.version = data["version"]
+            row.strategy = data["strategy"]
+            row.model = data["model"]
+            row.temperature = data["temperature"]
+            row.content = data["content"]
+            row.input_schema = data["input_schema"]
+            row.output_schema = data["output_schema"]
+            apply_prompt_override(data["prompt_id"], data["content"])
+        else:
+            apply_prompt_override(data["prompt_id"], row.content)
+    await session.commit()
 
 
 async def seed_if_empty(
@@ -67,8 +106,11 @@ async def seed_all(
             SemanticRole.FORMULA, SemanticRole.PARAMETER, SemanticRole.CONSTRAINT,
             SemanticRole.RULE, SemanticRole.EXAMPLE, SemanticRole.EXCEPTION, SemanticRole.REFERENCE,
             SemanticRole.SOLUTION, SemanticRole.CLASSIFICATION,
+            SemanticRole.METRIC, SemanticRole.COMPARISON, SemanticRole.LIMITATION,
+            SemanticRole.INTERFACE, SemanticRole.SUMMARY, SemanticRole.BACKGROUND,
         ]],
         chunk_policy="semantic_unit",
+        extraction_policy=normalized_policy(None),
         retrieval_policy={
             "definition": ["definition", "explanation"],
             "cause_analysis": ["definition", "root_cause", "principle"],
@@ -83,6 +125,7 @@ async def seed_all(
         version="V1",
         knowledge_type=KnowledgeType.INCIDENT_CASE.value,
         roles=["environment", "symptom", "impact", "root_cause", "solution", "prevention"],
+        extraction_policy=normalized_policy(None),
         retrieval_policy={"solution": ["symptom", "root_cause", "solution", "prevention"]},
         completeness_policy={"minimum_coverage": 0.8, "low_coverage": "secondary_retrieval"},
     )
@@ -91,6 +134,7 @@ async def seed_all(
         version="V1",
         knowledge_type=KnowledgeType.API_DOCUMENT.value,
         roles=["definition", "api_input", "api_output", "error_code", "constraint", "example"],
+        extraction_policy=normalized_policy(None),
         retrieval_policy={"definition": ["definition", "api_input", "api_output", "example"]},
         completeness_policy={"minimum_coverage": 0.9, "low_coverage": "return_warning"},
     )
@@ -133,21 +177,6 @@ async def seed_all(
     session.add(KnowledgeAcl(kb_id=kb.id, principal_type="role", principal_id="end_user", permission="read"))
     session.add(KnowledgeAcl(kb_id=kb.id, principal_type="role", principal_id="knowledge_expert", permission="write"))
 
-    for path in PROMPT_DIR.glob("*.yaml"):
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        session.add(
-            PromptTemplate(
-                prompt_id=data["prompt_id"],
-                version=data.get("version", "V1"),
-                strategy=data.get("strategy", ""),
-                model=data.get("model", "default"),
-                temperature=float(data.get("temperature") or 0.1),
-                content=data.get("content", ""),
-                status="production",
-                success_rate=0.94,
-            )
-        )
-
     for intent, steps in {
         QueryIntent.DEFINITION.value: [
             {"type": "query_analyze"}, {"type": "search_definition"}, {"type": "completeness_check"},
@@ -158,6 +187,9 @@ async def seed_all(
         ],
         QueryIntent.CAUSE.value: [
             {"type": "query_analyze"}, {"type": "search_cause"}, {"type": "hybrid_search"}, {"type": "completeness_check"},
+        ],
+        QueryIntent.COMPARISON.value: [
+            {"type": "query_analyze"}, {"type": "hybrid_search"}, {"type": "completeness_check"},
         ],
         QueryIntent.RISK.value: [
             {"type": "query_analyze"}, {"type": "search_risk"}, {"type": "hybrid_search"}, {"type": "completeness_check"},
@@ -271,6 +303,60 @@ async def seed_all(
                 optional_knowledge=[],
                 forbidden_knowledge=[],
                 expected_roles=["definition"],
+                kb_id=kb.id,
+            ),
+            GoldenCase(
+                dataset_name="jssc2016-hybrid-adc",
+                question="为什么这种 ADC 可以降低数字均衡器功耗？",
+                required_knowledge=["Fig. 4", "per-symbol", "bypass"],
+                optional_knowledge=["metric"],
+                forbidden_knowledge=[],
+                expected_roles=["principle", "interface", "metric"],
+                kb_id=kb.id,
+            ),
+            GoldenCase(
+                dataset_name="jssc2016-hybrid-adc",
+                question="α₋₁ 是怎么算的？",
+                required_knowledge=["Equation (1)"],
+                optional_knowledge=["Fig. 9"],
+                forbidden_knowledge=[],
+                expected_roles=["formula"],
+                kb_id=kb.id,
+            ),
+            GoldenCase(
+                dataset_name="jssc2016-hybrid-adc",
+                question="Fig.10 的 ADC 怎么分级？",
+                required_knowledge=["Fig. 10"],
+                optional_knowledge=["32-way", "312.5 MS/s"],
+                forbidden_knowledge=[],
+                expected_roles=["interface"],
+                kb_id=kb.id,
+            ),
+            GoldenCase(
+                dataset_name="jssc2016-hybrid-adc",
+                question="和先前 ADC-based receiver 比有什么指标？",
+                required_knowledge=["TABLE I"],
+                optional_knowledge=[],
+                forbidden_knowledge=[],
+                expected_roles=["metric", "comparison"],
+                kb_id=kb.id,
+            ),
+            GoldenCase(
+                dataset_name="jssc2016-hybrid-adc",
+                question="ADC 里嵌 FFE 的相关先前工作是哪篇？",
+                required_knowledge=["[12]"],
+                optional_knowledge=[],
+                forbidden_knowledge=[],
+                expected_roles=["reference"],
+                kb_id=kb.id,
+            ),
+            GoldenCase(
+                dataset_name="jssc2016-hybrid-adc",
+                question="论文 DOI 和发表信息？",
+                required_knowledge=["DOI"],
+                optional_knowledge=[],
+                forbidden_knowledge=[],
+                expected_roles=["summary"],
                 kb_id=kb.id,
             ),
         ]

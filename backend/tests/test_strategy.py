@@ -16,3 +16,9 @@ def test_solution_plan_requires_constraint():
     roles = {r.value for r in plan.required_roles}
     assert "solution" in roles
     assert "constraint" in roles
+
+
+def test_technical_ontology_includes_academic_genre():
+    ontology = registry.get(KnowledgeType.TECHNICAL_CONCEPT).ontology()
+    assert "academic_paper" in ontology["document_genres"]
+    assert "metric" in ontology["roles"]

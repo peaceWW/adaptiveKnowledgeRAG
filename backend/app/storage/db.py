@@ -39,6 +39,10 @@ async def init_db() -> None:
 def _migrate_schema(sync_conn) -> None:
     inspector = inspect(sync_conn)
     tables = inspector.get_table_names()
+    if "knowledge_strategy" in tables:
+        strategy_columns = {col["name"] for col in inspector.get_columns("knowledge_strategy")}
+        if "extraction_policy" not in strategy_columns:
+            sync_conn.execute(text("ALTER TABLE knowledge_strategy ADD COLUMN extraction_policy JSON"))
     if "document" in tables:
         columns = {col["name"] for col in inspector.get_columns("document")}
         if "enabled" not in columns:
@@ -55,6 +59,10 @@ def _migrate_schema(sync_conn) -> None:
             sync_conn.execute(text("ALTER TABLE document ADD COLUMN index_keywords JSON"))
         if "index_meta" not in columns:
             sync_conn.execute(text("ALTER TABLE document ADD COLUMN index_meta JSON"))
+    if "knowledge_unit" in tables:
+        unit_columns = {col["name"] for col in inspector.get_columns("knowledge_unit")}
+        if "unit_meta" not in unit_columns:
+            sync_conn.execute(text("ALTER TABLE knowledge_unit ADD COLUMN unit_meta JSON"))
     if "query_trace" in tables:
         columns = {col["name"] for col in inspector.get_columns("query_trace")}
         if "session_id" not in columns:

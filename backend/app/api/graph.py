@@ -1,14 +1,44 @@
 from collections import defaultdict
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.deps import get_stores
+from app.deps import get_stores, current_user
+from app.domain.design_map import build_design_map
+from app.domain.enums import RETRIEVAL_LIFECYCLES
 from app.storage.db import get_session
-from app.storage.models import Document, KnowledgeRelation, KnowledgeUnit
+from app.storage.models import Document, KnowledgeRelation, KnowledgeUnit, KnowledgeBase, KnowledgeAcl, User
 
 router = APIRouter(prefix="/graph", tags=["graph"])
+
+
+@router.get("/design-map")
+async def design_map(kb_id: str = "", session: AsyncSession = Depends(get_session), user: User = Depends(current_user)):
+    bases = (await session.execute(select(KnowledgeBase))).scalars().all()
+    rules = (await session.execute(select(KnowledgeAcl))).scalars().all()
+    allowed = []
+    for kb in bases:
+        permitted = user.role == "admin" or kb.access_scope == "public"
+        permitted |= kb.access_scope == "department" and bool(user.department) and kb.department == user.department
+        permitted |= kb.access_scope == "project" and bool(user.project) and kb.project == user.project
+        permitted |= any(r.kb_id == kb.id and r.permission in {"read", "write", "admin"} and (
+            (r.principal_type == "user" and r.principal_id == user.id) or
+            (r.principal_type == "role" and r.principal_id == user.role)
+        ) for r in rules)
+        if permitted:
+            allowed.append(kb)
+    allowed_ids = [kb.id for kb in allowed]
+    if kb_id and kb_id not in allowed_ids:
+        raise HTTPException(403, "无权访问该知识库")
+    selected = [kb_id] if kb_id else allowed_ids
+    units = (await session.execute(select(KnowledgeUnit).where(
+        KnowledgeUnit.kb_id.in_(selected), KnowledgeUnit.lifecycle.in_(list(RETRIEVAL_LIFECYCLES))
+    ).order_by(KnowledgeUnit.id))).scalars().all()
+    docs = (await session.execute(select(Document).where(Document.kb_id.in_(selected)))).scalars().all()
+    body = build_design_map(units, docs)
+    body["knowledge_bases"] = [{"id": kb.id, "name": kb.name} for kb in allowed]
+    return body
 
 ROLE_EDGE = {
     "root_cause": "HAS_PROBLEM",

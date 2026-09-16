@@ -24,6 +24,68 @@ function Write-Ok($message) { Write-Host "[akrag] $message" -ForegroundColor Gre
 function Write-Warn($message) { Write-Host "[akrag] $message" -ForegroundColor Yellow }
 function Write-Err($message) { Write-Host "[akrag] $message" -ForegroundColor Red }
 
+function Add-PathDir([string]$Dir) {
+    if ($Dir -and (Test-Path $Dir) -and ($env:PATH -notlike "*$Dir*")) {
+        $env:PATH = "$Dir;$env:PATH"
+    }
+}
+
+function Initialize-ToolPath {
+    $pythonRoot = Join-Path $env:LOCALAPPDATA "Programs\Python"
+    if (Test-Path $pythonRoot) {
+        Get-ChildItem $pythonRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            Add-PathDir $_.FullName
+            Add-PathDir (Join-Path $_.FullName "Scripts")
+        }
+    }
+    @(
+        "$env:USERPROFILE\.local\bin",
+        "$env:USERPROFILE\.cargo\bin",
+        "$env:LOCALAPPDATA\uv",
+        "C:\Program Files\nodejs",
+        "$env:APPDATA\npm"
+    ) | ForEach-Object { Add-PathDir $_ }
+}
+
+function Get-PythonExe {
+    $pythonRoot = Join-Path $env:LOCALAPPDATA "Programs\Python"
+    if (Test-Path $pythonRoot) {
+        $found = Get-ChildItem $pythonRoot -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName "python.exe" } |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+        if ($found) { return $found }
+    }
+    $cmd = Get-Command python -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source -notlike "*WindowsApps*") {
+        return $cmd.Source
+    }
+    return $null
+}
+
+function Ensure-Uv {
+    if (Test-CommandExists "uv") { return }
+    Write-Info "未找到 uv，尝试自动安装"
+    $python = Get-PythonExe
+    if ($python) {
+        & $python -m pip install uv
+        Initialize-ToolPath
+        if (Test-CommandExists "uv") { return }
+    }
+    try {
+        Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression
+        Initialize-ToolPath
+    } catch {
+        Write-Warn $_.Exception.Message
+    }
+    if (-not (Test-CommandExists "uv")) {
+        throw "未找到 uv。请先安装: https://docs.astral.sh/uv/getting-started/installation/"
+    }
+}
+
+Initialize-ToolPath
+
 function Ensure-RunDir {
     New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 }
@@ -104,6 +166,15 @@ function Invoke-Compose([string[]]$ComposeArgs) {
     }
 }
 
+function Set-SqliteDatabaseUrl([string]$EnvPath) {
+    $text = Get-Content $EnvPath -Raw -Encoding UTF8
+    if ($text -notmatch 'DATABASE_URL=sqlite') {
+        $text = $text -replace 'DATABASE_URL=.*', 'DATABASE_URL=sqlite+aiosqlite:///./data/akrag.db'
+        Set-Content -Path $EnvPath -Value $text -Encoding UTF8
+        Write-Info "未检测到 Docker，已将 DATABASE_URL 设为 SQLite"
+    }
+}
+
 function Ensure-Env([bool]$PreferSqlite) {
     $envPath = Join-Path $Root ".env"
     $example = Join-Path $Root ".env.example"
@@ -112,22 +183,16 @@ function Ensure-Env([bool]$PreferSqlite) {
             throw "缺少 .env.example，无法生成配置文件"
         }
         Copy-Item $example $envPath
-        if ($PreferSqlite) {
-            $text = Get-Content $envPath -Raw -Encoding UTF8
-            $text = $text -replace 'DATABASE_URL=.*', 'DATABASE_URL=sqlite+aiosqlite:///./data/akrag.db'
-            Set-Content -Path $envPath -Value $text -Encoding UTF8
-            Write-Info "未检测到 Docker，已将 DATABASE_URL 设为 SQLite"
-        } else {
-            Write-Info "已从 .env.example 创建 .env"
-        }
+        Write-Info "已从 .env.example 创建 .env"
+    }
+    if ($PreferSqlite) {
+        Set-SqliteDatabaseUrl $envPath
     }
 }
 
 function Invoke-Deploy {
     Write-Info "开始部署 / 安装依赖"
-    if (-not (Test-CommandExists "uv")) {
-        throw "未找到 uv。请先安装: https://docs.astral.sh/uv/getting-started/installation/"
-    }
+    Ensure-Uv
     if (-not (Test-CommandExists "npm")) {
         throw "未找到 npm / Node.js。请安装 Node.js 18+"
     }
@@ -188,9 +253,7 @@ function Start-Backend {
         Write-Warn "后端已在端口 $BackendPort 运行"
         return
     }
-    if (-not (Test-CommandExists "uv")) {
-        throw "未找到 uv，请先执行 deploy"
-    }
+    Ensure-Uv
     Ensure-RunDir
     $uv = (Get-Command uv).Source
     $log = Join-Path $RunDir "backend.log"
@@ -198,7 +261,7 @@ function Start-Backend {
     $proc = Start-Process -FilePath $uv -ArgumentList @(
         "run", "uvicorn", "app.main:app",
         "--app-dir", "backend",
-        "--host", "127.0.0.1",
+        "--host", "0.0.0.0",
         "--port", "$BackendPort"
     ) -WorkingDirectory $Root -RedirectStandardOutput $log -RedirectStandardError $err -WindowStyle Hidden -PassThru
     $proc.Id | Set-Content $BackendPidFile
@@ -245,10 +308,10 @@ function Invoke-Start {
     Start-Backend
     Start-Frontend
     Wait-Health
-    Write-Ok "应用已启动"
-    Write-Host "  前端:  http://localhost:$FrontendPort/"
-    Write-Host "  后端:  http://127.0.0.1:$BackendPort/"
-    Write-Host "  API:   http://127.0.0.1:$BackendPort/docs"
+    Write-Ok "应用已启动（监听 0.0.0.0，局域网可访问）"
+    Write-Host "  前端:  http://localhost:$FrontendPort/  （或 http://<本机IP>:$FrontendPort/）"
+    Write-Host "  后端:  http://0.0.0.0:$BackendPort/"
+    Write-Host "  API:   http://localhost:$BackendPort/docs"
 }
 
 function Invoke-Stop {
@@ -266,8 +329,8 @@ function Invoke-Stop {
 function Invoke-Status {
     $backend = if (Test-PortListening $BackendPort) { "running" } else { "stopped" }
     $frontend = if (Test-PortListening $FrontendPort) { "running" } else { "stopped" }
-    Write-Host "backend  : $backend   http://127.0.0.1:$BackendPort/"
-    Write-Host "frontend : $frontend   http://localhost:$FrontendPort/"
+    Write-Host "backend  : $backend   http://0.0.0.0:$BackendPort/"
+    Write-Host "frontend : $frontend   http://0.0.0.0:$FrontendPort/"
     if (Test-CommandExists "docker") {
         Write-Host "docker   : installed"
     } else {

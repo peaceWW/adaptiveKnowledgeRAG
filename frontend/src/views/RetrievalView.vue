@@ -1,311 +1,61 @@
 <template>
   <div class="retrieval-page">
-    <div class="hero">
-      <div>
-        <h2>检索中心</h2>
-        <p>按文档管理关键字与元数据索引，控制写入、修改与删除</p>
+    <header class="retrieval-header"><div><div class="eyebrow">RETRIEVAL WORKSPACE</div><h2>检索中心</h2><p>验证资料能否被找到，并定位检索问题。</p></div><div class="header-links"><a-button @click="router.push('/chat')">去智能问答 ↗</a-button><a-button @click="router.push('/graph')">按芯片模块找技术 ↗</a-button></div></header>
+    <div class="purpose-strip"><span><b>检索验证</b> 看系统找到了什么资料</span><span><b>智能问答</b> 用资料组织回答</span><span><b>知识图谱</b> 按模块浏览技术体系</span></div>
+    <a-tabs v-model:activeKey="tab" class="workspace-tabs"><a-tab-pane key="test" tab="检索验证" /><a-tab-pane key="indexes" tab="文档检索标签" /><a-tab-pane key="guide" tab="工作原理与排查" /></a-tabs>
+    <div v-show="tab === 'test'" class="test-workspace">
+      <section class="query-card"><div class="section-header"><div><h3>这条问题，能找到哪些依据？</h3><p>复用智能问答的首轮检索流程，展示知识片段；测试不会生成回答或写入会话历史。</p></div><a-tag color="blue">检索预检</a-tag></div><a-textarea v-model:value="query" :rows="3" :maxlength="2000" placeholder="例如：SAR ADC 接收机中有哪些降低功耗的方法？" aria-label="检索问题" :disabled="loading" @keydown="onKeydown" /><div class="query-controls"><div class="scope-controls"><label>知识库<a-select v-model:value="kbId" :options="kbs.map(k => ({ value: k.id, label: k.name }))" placeholder="选择知识库" :disabled="loading" aria-label="检索知识库" /></label><label>展示数量<a-select v-model:value="topK" :options="[5, 8, 12, 20].map(n => ({ value: n, label: `${n} 条` }))" :disabled="loading" aria-label="展示数量" /></label></div><a-button v-if="loading" @click="cancel">取消等待</a-button><a-button v-else type="primary" :disabled="!query.trim() || !kbId" @click="runTest">开始检索验证</a-button></div><div class="query-examples"><span>试一试</span><button v-for="example in examples" :key="example" :disabled="loading" @click="query = example">{{ example }}</button><small>Ctrl / ⌘ + Enter 开始</small></div></section>
+      <a-alert v-if="testError" class="test-error" type="warning" :message="testError" show-icon />
+      <div v-if="loading" class="loading-panel"><a-spin /><h3>正在理解问题并检索资料…</h3><p>包含问题分析、混合召回、重排和关联资料展开。</p></div>
+      <div v-else-if="result" class="results-layout">
+        <section class="results-panel"><div class="result-heading"><div><h3>检索结果 <span>{{ result.hits.length }} / {{ result.total }}</span></h3><p>{{ result.kb_name }} · {{ (result.elapsed_ms / 1000).toFixed(2) }} 秒 · {{ result.query }}</p></div><a-button :disabled="!result.hits.length" @click="askWithResult">用这个问题继续问答</a-button></div><p class="result-note">按实际检索顺序展示。排序分仅辅助排序，不表示答案正确率；问答后续可能补充检索。</p><a-empty v-if="!result.hits.length" description="没有找到可展示的知识片段"><p>先确认文档已完成抽取、存在可检索知识点，再尝试全称或同义词。</p><a-button @click="openIndexes()">检查文档收录与标签</a-button></a-empty><article v-for="(hit, index) in result.hits" :key="hit.id" class="hit-card"><div class="hit-heading"><span class="rank">{{ index + 1 }}</span><button @click="openSource(hit)">{{ hit.title }}</button><small>{{ viaLabel(hit.via) }}<template v-if="typeof hit.score === 'number'"> · 排序分 {{ hit.score.toFixed(3) }}</template></small></div><div class="hit-meta"><a-tag>{{ roleLabel(hit.semantic_role) }}</a-tag><span>{{ hit.document_title }}</span><span v-if="hit.source_page">p.{{ hit.source_page }}</span></div><div class="hit-excerpt" v-html="renderAnswer(hit.content?.slice(0, 850) || '暂无文本内容')"></div><div class="hit-actions"><a-button type="link" size="small" @click="openSource(hit)">查看完整片段{{ isPdf(hit) ? '与原 PDF' : '' }}</a-button><a-button v-if="hit.document_id" type="text" size="small" @click="openIndexes(hit.document_id)">检查文档标签</a-button><a-tag v-if="hit.image_key || hit.image_url" color="blue">包含图片</a-tag></div></article></section>
+        <aside class="diagnostics-panel"><h3>本次检索怎么完成的</h3><div v-for="stage in result.stages" :key="stage.key" class="stage"><span class="stage-check">✓</span><div><b>{{ stage.label }}</b><small>{{ (stage.elapsed_ms / 1000).toFixed(2) }} 秒</small></div></div><div class="diagnostic-section"><b>问题理解</b><p>{{ intentLabel(result.understanding.intent) }}</p><div><a-tag v-for="topic in result.understanding.topics || []" :key="topic">{{ topic }}</a-tag></div></div><div class="diagnostic-section"><b>召回与整理数量</b><div v-for="metric in metrics" :key="metric.key" class="diagnostic-metric"><span>{{ metric.label }}</span><strong>{{ result.retrieval[metric.key] ?? '—' }}</strong></div><small>通道间可能重复；关键词统计包含文档索引补充。</small></div><div class="diagnostic-section"><b>服务状态</b><p>{{ result.services.vector ? '向量服务已连接' : '向量服务未连接，可能使用本地回退' }}</p><p>{{ result.services.keyword ? '关键词服务已连接' : '关键词服务未连接，使用本地或数据库检索' }}</p><p v-if="!result.services.model">模型未配置，问题分析与重排使用本地回退规则。</p><small>连接状态不等于各通道都产生了命中。</small></div><a-button block @click="tab = 'guide'">结果不理想？查看排查建议</a-button></aside>
       </div>
-      <a-tabs v-model:activeKey="tab">
-        <a-tab-pane key="index" tab="索引管理" />
-        <a-tab-pane key="planner" tab="Retrieval Planner" />
-      </a-tabs>
+      <div v-else-if="!testError" class="start-guide"><h3>什么时候使用这里？</h3><div><article><b>问答引用了不相关资料</b><p>用相同问题预检，查看召回内容与排序。</p></article><article><b>上传的文档找不到</b><p>检查可检索知识点数量，再补充标签。</p></article><article><b>调整标签后想看效果</b><p>重复同一个问题，核对文档是否被找到。</p></article></div></div>
     </div>
-
-    <div v-show="tab === 'index'" class="workspace">
-      <aside class="doc-pane">
-        <div class="pane-title">文档索引</div>
-        <a-select v-model:value="kbId" allow-clear placeholder="全部知识库" class="full" @change="loadIndexes">
-          <a-select-option v-for="kb in kbs" :key="kb.id" :value="kb.id">{{ kb.name }}</a-select-option>
-        </a-select>
-        <a-input-search
-          v-model:value="keyword"
-          allow-clear
-          placeholder="搜索文件名或关键字"
-          class="search"
-          @search="loadIndexes"
-        />
-        <a-empty v-if="!docs.length" description="暂无文档索引" />
-        <div
-          v-for="doc in docs"
-          :key="doc.id"
-          class="doc-row"
-          :class="{ selected: selectedId === doc.id }"
-          @click="selectDoc(doc.id)"
-        >
-          <div class="doc-name">{{ doc.filename }}</div>
-          <div class="doc-sub">
-            <a-tag :color="doc.indexed ? 'blue' : 'default'">{{ doc.keyword_count }} 个关键字</a-tag>
-            <span>{{ statusLabel(doc.status) }}</span>
-          </div>
-        </div>
-      </aside>
-
-      <section class="editor-pane" v-if="current">
-        <div class="editor-head">
-          <div>
-            <h3>{{ current.filename }}</h3>
-            <div class="muted">知识单元 {{ current.unit_count }} · {{ current.enabled ? "已启用" : "未启用" }}</div>
-          </div>
-          <a-space>
-            <a-button :loading="saving" @click="saveIndex">保存修改</a-button>
-            <a-button :loading="reindexing" @click="reindex">重建索引</a-button>
-            <a-popconfirm title="清空该文档的关键字和元数据索引？文档本身不会删除。" @confirm="clearIndex">
-              <a-button danger>清空索引</a-button>
-            </a-popconfirm>
-          </a-space>
-        </div>
-
-        <div class="card">
-          <div class="card-head">
-            <div class="card-title">关键字索引</div>
-            <a-space>
-              <a-input v-model:value="newKeyword" placeholder="新增关键字" style="width: 180px" @pressEnter="addKeyword" />
-              <a-input-number v-model:value="newWeight" :min="0" :max="5" :step="0.1" style="width: 90px" />
-              <a-button type="primary" @click="addKeyword">添加</a-button>
-            </a-space>
-          </div>
-          <a-empty v-if="!draft.keywords.length" description="暂无关键字，可手动添加或点击重建索引" />
-          <div v-for="(item, index) in draft.keywords" :key="item.keyword + index" class="kv-row">
-            <a-input v-model:value="item.keyword" placeholder="关键字" />
-            <a-input-number v-model:value="item.weight" :min="0" :max="5" :step="0.1" />
-            <a-tag>{{ sourceLabel(item.source) }}</a-tag>
-            <a-button type="text" danger @click="removeKeyword(index)">删除</a-button>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-head">
-            <div class="card-title">元数据索引</div>
-            <a-space>
-              <a-input v-model:value="newMetaKey" placeholder="字段名" style="width: 140px" @pressEnter="addMeta" />
-              <a-input v-model:value="newMetaValue" placeholder="字段值" style="width: 180px" @pressEnter="addMeta" />
-              <a-button type="primary" @click="addMeta">添加</a-button>
-            </a-space>
-          </div>
-          <a-empty v-if="!draft.metadata.length" description="暂无元数据字段" />
-          <div v-for="(item, index) in draft.metadata" :key="item.key + index" class="kv-row">
-            <a-input v-model:value="item.key" placeholder="字段名" />
-            <a-input v-model:value="item.value" placeholder="字段值" />
-            <span class="muted">索引字段</span>
-            <a-button type="text" danger @click="removeMeta(index)">删除</a-button>
-          </div>
-        </div>
-      </section>
-
-      <section v-else class="editor-pane empty">
-        <a-empty description="选择左侧文档，管理其关键字与元数据索引" />
-      </section>
-    </div>
-
-    <div v-show="tab === 'planner'">
-      <a-card v-for="p in planners" :key="p.id" class="planner-card">
-        <h3>{{ p.query_type }}</h3>
-        <a-list :data-source="p.steps">
-          <template #renderItem="{ item, index }">
-            <a-list-item>{{ index + 1 }}. {{ item.type }}</a-list-item>
-          </template>
-        </a-list>
-        <p class="muted">Completeness threshold：{{ p.completeness_threshold }} · Secondary：{{ p.secondary_retrieval }}</p>
-      </a-card>
-    </div>
+    <RetrievalIndexes v-if="indexesVisited" v-show="tab === 'indexes'" :kbs="kbs" :document-id="maintenanceDocId" :initial-kb="maintenanceKb" @test="id => { kbId = id; tab = 'test'; }" />
+    <section v-show="tab === 'guide'" class="guide-panel"><h3>检索中心负责什么？</h3><p>帮助知识维护人员判断“资料有没有收录、问题能否找到资料、标签是否需要补充”。需要完整答案时使用智能问答；需要按芯片模块查找技术时使用知识图谱。</p><div class="flow-grid"><article v-for="(step, i) in guideSteps" :key="step.title"><small>0{{ i + 1 }}</small><h4>{{ step.title }}</h4><p>{{ step.text }}</p></article></div><h3>常见问题怎么排查？</h3><div class="troubleshooting"><article><h4>文档有标签，但检索没命中</h4><p>标签是文档线索，实际返回的是知识点。先在“文档检索标签”确认可检索知识点大于 0，再查看抽取内容。</p><a-button @click="openIndexes()">检查收录</a-button></article><article><h4>片段相关，但最终回答不理想</h4><p>本页只检查首轮检索；答案还受到补充检索、完整性检查及生成提示词的影响。带着问题去智能问答核对来源。</p><a-button @click="router.push('/chat')">打开智能问答</a-button></article><article><h4>补全标签后没有变化</h4><p>补全保留人工与模型标签，只补足缺失信息并同步文档索引。它不会重新抽取文档或重新计算知识向量。</p></article></div><details class="planner-details"><summary>高级：已保存的检索流程配置（{{ planners.length }}）</summary><p>以下为保存的配置记录。配置步骤名称不代表全部被执行；本次实际执行阶段以“检索验证”的结果为准。</p><div v-for="p in planners" :key="p.id" class="planner-row"><b>{{ intentLabel(p.query_type) }}</b><span>{{ (p.steps || []).map((s: any) => stepLabel(s.type)).join(' → ') }}</span><small>配置完整性阈值 {{ p.completeness_threshold }} · 补充检索 {{ p.secondary_retrieval ? '启用' : '关闭' }}</small></div><a-empty v-if="!planners.length" description="未保存额外流程配置，使用当前默认流程" /></details></section>
+    <a-modal v-model:open="showSource" :title="source?.title" :width="1150" :footer="null" destroy-on-close><div v-if="source" class="source-layout"><div class="source-text"><p>{{ source.document_title }} · {{ source.source_chapter }} · p.{{ source.source_page || '未记录' }}</p><div class="hit-excerpt" v-html="renderAnswer(source.content || '')"></div><DocumentAsset v-if="source.image_key || source.image_url" :document-id="source.document_id || ''" :image-key="source.image_key" :image-url="source.image_key ? undefined : source.image_url" :alt="source.title" /></div><PdfSourceViewer v-if="isPdf(source) && !textOnly" :document-id="source.document_id" :filename="source.filename" :source-page="source.source_page" :source-key="source.id" @show-text="textOnly = true" /></div></a-modal>
   </div>
 </template>
-
 <script setup lang="ts">
-import { onMounted, reactive, ref } from "vue";
-import { message } from "ant-design-vue";
-import { api } from "../api";
-
-type KeywordItem = { keyword: string; weight: number; source: string };
-type MetaItem = { key: string; value: string };
-
-const tab = ref("index");
-const kbs = ref<any[]>([]);
-const docs = ref<any[]>([]);
-const planners = ref<any[]>([]);
-const kbId = ref<string | undefined>();
-const keyword = ref("");
-const selectedId = ref<string>();
-const current = ref<any>();
-const saving = ref(false);
-const reindexing = ref(false);
-const newKeyword = ref("");
-const newWeight = ref(1);
-const newMetaKey = ref("");
-const newMetaValue = ref("");
-const draft = reactive<{ keywords: KeywordItem[]; metadata: MetaItem[] }>({
-  keywords: [],
-  metadata: [],
-});
-
-function statusLabel(status: string) {
-  const map: Record<string, string> = {
-    uploaded: "已上传",
-    parsing: "解析中",
-    awaiting_strategy: "待确认策略",
-    extracting: "抽取中",
-    review: "待审核",
-    indexed: "已索引",
-  };
-  return map[status] || status;
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { useRouter } from 'vue-router';
+import { api } from '../api';
+import { renderAnswer } from '../answer';
+import RetrievalIndexes from '../components/RetrievalIndexes.vue';
+import PdfSourceViewer from '../components/PdfSourceViewer.vue';
+import DocumentAsset from '../components/DocumentAsset.vue';
+import { useSession } from '../stores/session';
+const router = useRouter(), session = useSession();
+const tab = ref('test'), indexesVisited = ref(false), kbs = ref<any[]>([]), planners = ref<any[]>([]), query = ref(''), kbId = ref<string>(), topK = ref(8), loading = ref(false), result = ref<any>(), testError = ref(''), maintenanceDocId = ref<string>(), maintenanceKb = ref<string>(), showSource = ref(false), source = ref<any>(), textOnly = ref(false);
+let controller: AbortController | undefined, version = 0;
+const examples = ['SAR ADC 如何降低功耗？', 'DFE 与 CTLE 的区别', 'CDC 的亚稳态如何处理？'];
+const metrics = [{key:'vector',label:'向量召回'}, {key:'keyword',label:'关键词与文档索引'}, {key:'exact',label:'图表编号精确匹配'}, {key:'graph',label:'图谱召回'}, {key:'fused',label:'融合后候选'}, {key:'reranked',label:'重排保留'}, {key:'expanded',label:'关联展开后'}];
+const guideSteps = [{title:'理解问题',text:'识别主题、问题类型与需要查找的知识。'}, {title:'召回资料',text:'结合向量、关键词、文档线索及可用的关联信息寻找知识点。'}, {title:'整理结果',text:'合并候选、重排，并补充父级上下文及关联图表。'}, {title:'继续问答',text:'进入智能问答后，才进行完整性检查、必要的补充检索和回答生成。'}];
+const intentLabel = (key: string) => ({ definition:'概念定义', cause_analysis:'原因分析', solution:'解决方案', risk_analysis:'风险分析', comparison:'技术对比' } as Record<string,string>)[key] || key || '未识别';
+const stepLabel = (key: string) => ({query_analyze:'问题分析',catalog_route:'目录定位',hybrid_search:'混合检索',rerank:'候选重排',completeness_check:'完整性检查'} as Record<string,string>)[key] || key;
+const roleLabel = (key: string) => ({definition:'定义',principle:'原理',solution:'方案',constraint:'约束',metric:'指标',parameter:'参数',comparison:'对比',formula:'公式',example:'示例',classification:'分类',root_cause:'原因'} as Record<string,string>)[key] || '知识片段';
+const viaLabel = (key: string) => ({rerank:'重排结果',fused:'融合结果',parent:'父级上下文',relation:'关联资料',secondary:'补充检索'} as Record<string,string>)[key] || '检索结果';
+const isPdf = (hit: any) => Boolean(hit?.document_id && /\.pdf$/i.test(hit.filename || ''));
+function openSource(hit: any) { source.value = hit; textOnly.value = false; showSource.value = true; }
+function openIndexes(id?: string) { maintenanceDocId.value = id; maintenanceKb.value = result.value?.kb_id || kbId.value; tab.value = 'indexes'; }
+function askWithResult() { router.push({name:'chat',query:{question:result.value.query,kb_id:result.value.kb_id}}); }
+function cancel() { version++; controller?.abort(); loading.value = false; testError.value = '已取消等待。可以修改问题后重新检索。'; }
+async function runTest() {
+  if (loading.value || !query.value.trim() || !kbId.value) return;
+  controller?.abort(); controller = new AbortController(); const request = ++version;
+  loading.value = true; result.value = undefined; testError.value = '';
+  try { const {data} = await api.post('/retrieval/test',{query:query.value.trim(),kb_id:kbId.value,top_k:topK.value},{signal:controller.signal}); if(request === version) result.value = data; }
+  catch(err: any) { if(request === version && err.code !== 'ERR_CANCELED') testError.value = '检索未完成，请检查服务连接后重试。'; }
+  finally { if(request === version) loading.value = false; }
 }
-
-function sourceLabel(source: string) {
-  if (source === "extracted") return "抽取";
-  if (source === "manual") return "手工";
-  return source || "手工";
-}
-
-function applyDraft(payload: any) {
-  current.value = payload;
-  draft.keywords = (payload.keywords || []).map((item: KeywordItem) => ({
-    keyword: item.keyword,
-    weight: Number(item.weight || 1),
-    source: item.source || "manual",
-  }));
-  draft.metadata = Object.entries(payload.metadata || {}).map(([key, value]) => ({
-    key,
-    value: value == null ? "" : String(value),
-  }));
-}
-
-function metadataPayload() {
-  const result: Record<string, string> = {};
-  for (const item of draft.metadata) {
-    const key = item.key.trim();
-    if (!key) continue;
-    result[key] = item.value;
-  }
-  return result;
-}
-
-async function loadIndexes() {
-  const params: Record<string, string> = {};
-  if (kbId.value) params.kb_id = kbId.value;
-  if (keyword.value.trim()) params.q = keyword.value.trim();
-  docs.value = (await api.get("/retrieval/indexes", { params })).data;
-  if (selectedId.value && !docs.value.some((item) => item.id === selectedId.value)) {
-    selectedId.value = undefined;
-    current.value = undefined;
-  }
-}
-
-async function selectDoc(id: string) {
-  selectedId.value = id;
-  const payload = (await api.get(`/retrieval/indexes/${id}`)).data;
-  applyDraft(payload);
-}
-
-function addKeyword() {
-  const text = newKeyword.value.trim();
-  if (!text) return;
-  if (draft.keywords.some((item) => item.keyword.toLowerCase() === text.toLowerCase())) {
-    message.warning("关键字已存在");
-    return;
-  }
-  draft.keywords.push({ keyword: text, weight: Number(newWeight.value || 1), source: "manual" });
-  newKeyword.value = "";
-  newWeight.value = 1;
-}
-
-function removeKeyword(index: number) {
-  draft.keywords.splice(index, 1);
-}
-
-function addMeta() {
-  const key = newMetaKey.value.trim();
-  if (!key) return;
-  if (draft.metadata.some((item) => item.key === key)) {
-    message.warning("字段已存在");
-    return;
-  }
-  draft.metadata.push({ key, value: newMetaValue.value });
-  newMetaKey.value = "";
-  newMetaValue.value = "";
-}
-
-function removeMeta(index: number) {
-  draft.metadata.splice(index, 1);
-}
-
-async function saveIndex() {
-  if (!selectedId.value) return;
-  saving.value = true;
-  try {
-    const payload = (
-      await api.put(`/retrieval/indexes/${selectedId.value}`, {
-        keywords: draft.keywords.filter((item) => item.keyword.trim()),
-        metadata: metadataPayload(),
-      })
-    ).data;
-    applyDraft(payload);
-    await loadIndexes();
-    message.success("索引已保存");
-  } finally {
-    saving.value = false;
-  }
-}
-
-async function reindex() {
-  if (!selectedId.value) return;
-  reindexing.value = true;
-  try {
-    const payload = (await api.post(`/retrieval/indexes/${selectedId.value}/reindex`)).data;
-    applyDraft(payload);
-    await loadIndexes();
-    message.success("已重建索引");
-  } finally {
-    reindexing.value = false;
-  }
-}
-
-async function clearIndex() {
-  if (!selectedId.value) return;
-  await api.delete(`/retrieval/indexes/${selectedId.value}`);
-  applyDraft({ ...current.value, keywords: [], metadata: {}, keyword_count: 0, indexed: false });
-  await loadIndexes();
-  message.success("已清空该文档索引");
-}
-
-onMounted(async () => {
-  kbs.value = (await api.get("/knowledge-bases")).data;
-  planners.value = (await api.get("/retrieval/planners")).data;
-  await loadIndexes();
-  if (docs.value.length) await selectDoc(docs.value[0].id);
-});
+function onKeydown(event: KeyboardEvent) { if(event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing) { event.preventDefault(); void runTest(); } }
+async function loadBasics() { await Promise.allSettled([api.get('/knowledge-bases').then(({data})=>{kbs.value=data;kbId.value=data[0]?.id;}),api.get('/retrieval/planners').then(({data})=>planners.value=data)]); }
+watch(tab, value => { if(value === 'indexes') indexesVisited.value = true; });
+watch(()=>session.username,()=>{version++;controller?.abort();loading.value=false;result.value=undefined;showSource.value=false;indexesVisited.value=false;tab.value='test';void loadBasics();});
+onMounted(loadBasics); onBeforeUnmount(()=>{version++;controller?.abort();});
 </script>
-
 <style scoped>
-.retrieval-page { max-width: 1280px; }
-.hero { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 8px; }
-.hero h2 { margin: 0; font-size: 22px; }
-.hero p { margin: 6px 0 0; color: #6b7280; }
-.hero :deep(.ant-tabs) { min-width: 320px; }
-.workspace { display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 16px; align-items: start; }
-.doc-pane, .editor-pane, .planner-card, .card {
-  background: #fff;
-  border-radius: 12px;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
-}
-.doc-pane { padding: 16px; min-height: 560px; }
-.pane-title { font-weight: 700; margin-bottom: 12px; }
-.full, .search { width: 100%; margin-bottom: 10px; }
-.doc-row { padding: 10px 8px; border-radius: 10px; cursor: pointer; }
-.doc-row:hover, .doc-row.selected { background: #eff6ff; }
-.doc-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.doc-sub { display: flex; justify-content: space-between; gap: 8px; color: #6b7280; font-size: 12px; margin-top: 4px; }
-.editor-pane { padding: 18px; min-height: 560px; }
-.editor-pane.empty { display: grid; place-items: center; }
-.editor-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; margin-bottom: 16px; }
-.editor-head h3 { margin: 0 0 4px; }
-.muted { color: #6b7280; font-size: 12px; }
-.card { padding: 16px; margin-bottom: 14px; box-shadow: none; border: 1px solid #eef2f7; }
-.card-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
-.card-title { font-weight: 700; }
-.kv-row { display: grid; grid-template-columns: minmax(0, 1.4fr) 120px 80px 64px; gap: 8px; align-items: center; margin-bottom: 8px; }
-.planner-card { margin-bottom: 12px; }
-@media (max-width: 960px) {
-  .hero { flex-direction: column; }
-  .workspace { grid-template-columns: 1fr; }
-}
+.retrieval-page{color:#263650}.retrieval-header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px}.eyebrow{font-size:10px;letter-spacing:1.8px;color:#8b9cba;margin-bottom:6px}.retrieval-header h2{font-size:24px;margin:0}.retrieval-header p{color:#8090a6;margin:6px 0 0;font-size:13px}.header-links{display:flex;gap:10px}.purpose-strip{display:flex;gap:32px;padding:16px 20px;border:1px solid #e2e9f4;border-radius:10px;background:white;font-size:12px;color:#8a98ad;flex-wrap:wrap}.purpose-strip b{color:#49618a;margin-right:8px}.workspace-tabs{margin-top:12px}.workspace-tabs :deep(.ant-tabs-content-holder){display:none}.query-card,.results-panel,.diagnostics-panel,.guide-panel,.start-guide{border:1px solid #e3eaf4;border-radius:12px;background:white;padding:24px}.section-header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:14px}.section-header h3{font-size:17px;margin:0}.section-header p{font-size:12px;color:#8a98ad;margin:8px 0 0;line-height:1.8}.query-card textarea{padding:14px;font-size:14px;background:#fcfdff;border-radius:8px}.query-controls{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin:16px 0}.scope-controls{display:flex;gap:16px;flex-wrap:wrap}.scope-controls label{display:flex;align-items:center;gap:8px;font-size:12px;color:#71839f}.scope-controls label:first-child .ant-select{width:230px}.scope-controls label:last-child .ant-select{width:90px}.query-examples{display:flex;gap:8px;flex-wrap:wrap;align-items:center;font-size:11px;color:#97a3b5}.query-examples button{background:#f5f8fd;border:0;border-radius:6px;padding:6px 10px;color:#6e81a2;cursor:pointer}.query-examples small{margin-left:auto}.results-layout{display:grid;grid-template-columns:minmax(0,1fr) 290px;gap:16px;margin-top:18px;align-items:start}.result-heading{display:flex;justify-content:space-between;gap:12px}.result-heading h3{margin:0;font-size:17px}.result-heading h3 span{font-size:12px;color:#879bb9;margin-left:8px}.result-heading p{font-size:12px;color:#8b98ac;line-height:1.7;overflow-wrap:anywhere}.result-note{font-size:11px;color:#8a99ae;padding:10px 12px;background:#f7f9fd;border-radius:6px}.hit-card{padding:20px 0;border-bottom:1px solid #edf1f7}.hit-heading{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.rank{display:grid;place-items:center;width:24px;height:24px;flex-shrink:0;background:#eef3ff;color:#436bc4;border-radius:6px;font-size:12px}.hit-heading>button{font-weight:600;font-size:15px;border:0;background:transparent;color:#344f7f;text-align:left;cursor:pointer;padding:0;overflow-wrap:anywhere}.hit-heading small{margin-left:auto;color:#8f9db2;font-size:10px}.hit-meta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:#8a98ae;font-size:11px;margin:12px 0}.hit-meta>span{overflow-wrap:anywhere}.hit-excerpt{font-size:13px;line-height:1.9;color:#576b89;overflow-wrap:anywhere}.hit-excerpt :deep(img){max-width:100%}.hit-excerpt :deep(pre),.hit-excerpt :deep(.katex-display){overflow:auto}.hit-excerpt :deep(table){display:block;max-width:100%;overflow:auto}.hit-excerpt :deep(h1),.hit-excerpt :deep(h2){font-size:16px}.hit-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}.diagnostics-panel h3{font-size:14px;margin:0 0 20px}.stage{display:flex;gap:12px;margin-bottom:18px}.stage-check{color:#42a882}.stage b{font-size:12px;font-weight:500}.stage small{display:block;color:#92a0b5;font-size:10px;margin-top:4px}.diagnostic-section{border-top:1px solid #eaf0f7;padding-top:16px;margin-top:16px;font-size:12px}.diagnostic-section>b{display:block;margin-bottom:12px}.diagnostic-section p{color:#8090a7;font-size:11px;line-height:1.8}.diagnostic-section small{color:#9aa6b7;font-size:10px;line-height:1.8}.diagnostic-metric{display:flex;justify-content:space-between;margin:10px 0;color:#7b8eab;font-size:12px}.diagnostic-metric strong{color:#446698}.diagnostics-panel>.ant-btn{margin-top:20px;font-size:11px}.start-guide{margin-top:18px}.start-guide h3{font-size:15px}.start-guide>div,.troubleshooting{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px}.start-guide article{background:#f8faff;border-radius:8px;padding:18px}.start-guide b{font-size:13px;color:#54709b}.start-guide p{font-size:12px;color:#899bb4;line-height:1.8}.loading-panel{text-align:center;padding:50px;color:#8294ae}.loading-panel h3{font-size:15px;margin:18px 0 8px}.loading-panel p{font-size:12px}.test-error{margin-top:16px}.guide-panel>p{font-size:13px;line-height:1.9;color:#788da9}.guide-panel h3{font-size:17px}.flow-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin:24px 0 32px}.flow-grid article{background:#f6f9ff;border:1px solid #e5ecf8;border-radius:8px;padding:18px}.flow-grid small{color:#80a0de}.flow-grid h4{margin:8px 0}.flow-grid p,.troubleshooting p{font-size:12px;color:#8193ad;line-height:1.9}.troubleshooting article{padding:16px;border:1px solid #e7edf5;border-radius:8px}.planner-details{margin-top:26px;padding-top:18px;border-top:1px solid #e8eef6}.planner-details summary{cursor:pointer;font-size:13px}.planner-details>p{font-size:12px;color:#8a9ab1;line-height:1.9}.planner-row{padding:12px;border-bottom:1px solid #edf2f8;display:flex;flex-direction:column;gap:8px;font-size:12px}.planner-row span,.planner-row small{color:#8a9ab1}.source-layout{display:flex;gap:20px;align-items:flex-start}.source-text{flex:1;min-width:0;max-height:75vh;overflow:auto}.source-text>p{color:#8a9ab1;font-size:12px}.source-layout :deep(.pdf-viewer){flex:1;min-width:0}@media(max-width:1100px){.results-layout{grid-template-columns:1fr}.diagnostics-panel{display:block}.flow-grid{grid-template-columns:repeat(2,1fr)}.retrieval-header{align-items:flex-start;flex-direction:column}.purpose-strip{gap:12px}.source-layout{flex-direction:column}.source-layout :deep(.pdf-viewer){width:100%}}@media(max-width:700px){.query-card,.results-panel,.guide-panel,.start-guide{padding:16px}.query-controls,.result-heading{flex-direction:column;align-items:stretch}.scope-controls label:first-child .ant-select{width:170px}.scope-controls{gap:12px}.header-links{flex-wrap:wrap}.purpose-strip{flex-direction:column}.start-guide>div,.troubleshooting,.flow-grid{grid-template-columns:1fr}.query-examples small{margin-left:0}.hit-heading small{margin-left:0}}
 </style>

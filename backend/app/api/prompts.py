@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import PromptTest, PromptUpdate
 from app.deps import get_stores
+from app.prompts.loader import apply_prompt_override, prompt_catalog
 from app.storage.db import get_session
 from app.storage.models import PromptTemplate
 
@@ -33,6 +34,7 @@ async def update_prompt(
     if payload.temperature is not None:
         prompt.temperature = payload.temperature
     await session.commit()
+    apply_prompt_override(prompt.prompt_id, prompt.content)
     return _serialize(prompt)
 
 
@@ -51,9 +53,11 @@ async def test_prompt(
 
 
 def _serialize(prompt: PromptTemplate) -> dict:
+    meta = prompt_catalog().get(prompt.prompt_id) or {}
     return {
         "id": prompt.id,
         "prompt_id": prompt.prompt_id,
+        "title": meta.get("title") or prompt.prompt_id,
         "version": prompt.version,
         "strategy": prompt.strategy,
         "model": prompt.model,
@@ -61,4 +65,6 @@ def _serialize(prompt: PromptTemplate) -> dict:
         "content": prompt.content,
         "status": prompt.status,
         "success_rate": prompt.success_rate,
+        "input_schema": prompt.input_schema or {},
+        "output_schema": prompt.output_schema or {},
     }

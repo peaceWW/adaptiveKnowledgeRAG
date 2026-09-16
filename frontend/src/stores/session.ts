@@ -4,8 +4,8 @@ import { computed, ref } from "vue";
 export type UserRole = "end_user" | "knowledge_expert" | "algorithm_engineer" | "admin";
 
 const ROLE_MENUS: Record<UserRole, string[]> = {
-  end_user: ["dashboard", "chat"],
-  knowledge_expert: ["dashboard", "chat", "kb", "documents", "review", "catalog"],
+  end_user: ["dashboard", "chat", "graph"],
+  knowledge_expert: ["dashboard", "chat", "graph", "kb", "documents", "review", "catalog"],
   algorithm_engineer: [
     "dashboard",
     "chat",
@@ -17,6 +17,7 @@ const ROLE_MENUS: Record<UserRole, string[]> = {
     "prompts",
     "retrieval",
     "evaluation",
+    "graph",
   ],
   admin: [
     "dashboard",

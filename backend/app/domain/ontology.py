@@ -51,6 +51,39 @@ SEMICONDUCTOR_ONTOLOGY_V1: list[dict] = [
                     {"name": "MBIST", "level": 2, "related": ["memory"]},
                 ],
             },
+            {
+                "name": "Mixed Signal",
+                "level": 1,
+                "children": [
+                    {
+                        "name": "Data Converter",
+                        "level": 2,
+                        "children": [
+                            {
+                                "name": "ADC",
+                                "level": 3,
+                                "related": ["SAR", "TI-ADC", "ENOB", "SNDR", "time interleaving"],
+                            },
+                            {"name": "SAR", "level": 3, "related": ["ADC", "DAC"]},
+                            {"name": "TI-ADC", "level": 3, "related": ["time interleaving", "mismatch"]},
+                        ],
+                    },
+                    {
+                        "name": "Wireline Receiver",
+                        "level": 2,
+                        "children": [
+                            {
+                                "name": "Equalization",
+                                "level": 3,
+                                "related": ["FFE", "DFE", "CTLE", "embedded equalization"],
+                            },
+                            {"name": "FFE", "level": 3, "related": ["DFE", "ISI"]},
+                            {"name": "DFE", "level": 3, "related": ["FFE", "ISI", "BER"]},
+                            {"name": "CDR", "level": 3, "related": ["clock recovery", "jitter"]},
+                        ],
+                    },
+                ],
+            },
         ],
     }
 ]
@@ -72,3 +105,18 @@ def flatten_ontology(nodes: list[dict] | None = None, parent_path: str = "") -> 
         )
         rows.extend(flatten_ontology(node.get("children") or [], path))
     return rows
+
+
+def ontology_rows_for_concepts(concepts: list[str] | None) -> list[dict]:
+    """只返回与抽取概念命中的本体路径（含祖先），避免把整棵半导体树灌进空知识库。"""
+    needles = {str(item).strip().lower() for item in (concepts or []) if str(item).strip()}
+    if not needles:
+        return []
+    wanted: set[str] = set()
+    for row in flatten_ontology():
+        names = {row["name"].lower(), *[str(item).lower() for item in row.get("related_concepts") or []]}
+        if names & needles:
+            parts = row["path"].split("/")
+            for index in range(len(parts)):
+                wanted.add("/".join(parts[: index + 1]))
+    return [row for row in flatten_ontology() if row["path"] in wanted]

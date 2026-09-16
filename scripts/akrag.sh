@@ -182,7 +182,7 @@ start_backend() {
   mkdir -p "$RUN_DIR"
   (
     cd "$ROOT"
-    nohup uv run uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port "$BACKEND_PORT" \
+    nohup uv run uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port "$BACKEND_PORT" \
       >> "$RUN_DIR/backend.log" 2>&1 &
     echo $! > "$BACKEND_PID_FILE"
   )
@@ -230,10 +230,10 @@ cmd_start() {
   start_backend
   start_frontend
   wait_health
-  ok "应用已启动"
-  echo "  前端:  http://localhost:${FRONTEND_PORT}/"
-  echo "  后端:  http://127.0.0.1:${BACKEND_PORT}/"
-  echo "  API:   http://127.0.0.1:${BACKEND_PORT}/docs"
+  ok "应用已启动（监听 0.0.0.0，局域网可访问）"
+  echo "  前端:  http://localhost:${FRONTEND_PORT}/  （或 http://<本机IP>:${FRONTEND_PORT}/）"
+  echo "  后端:  http://0.0.0.0:${BACKEND_PORT}/"
+  echo "  API:   http://localhost:${BACKEND_PORT}/docs"
 }
 
 cmd_stop() {
@@ -252,8 +252,8 @@ cmd_status() {
   local backend="stopped" frontend="stopped"
   port_listening "$BACKEND_PORT" && backend="running"
   port_listening "$FRONTEND_PORT" && frontend="running"
-  echo "backend  : $backend   http://127.0.0.1:${BACKEND_PORT}/"
-  echo "frontend : $frontend   http://localhost:${FRONTEND_PORT}/"
+  echo "backend  : $backend   http://0.0.0.0:${BACKEND_PORT}/"
+  echo "frontend : $frontend   http://0.0.0.0:${FRONTEND_PORT}/"
   if have_cmd docker; then
     echo "docker   : installed"
   else

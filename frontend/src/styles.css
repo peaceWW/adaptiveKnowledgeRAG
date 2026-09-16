@@ -6,6 +6,10 @@
   --muted: #6b7280;
   --brand: #1d4ed8;
 }
+* { box-sizing: border-box; }
+.ant-layout { min-width: 0; }
+.ant-table-wrapper { overflow-x: auto; }
+button:focus-visible, [tabindex]:focus-visible { outline: 2px solid #2563eb; outline-offset: 3px; }
 html, body, #app {
   margin: 0;
   height: 100%;

@@ -53,6 +53,8 @@ async def health():
         "neo4j": stores.neo4j.available,
         "model_gateway": settings.use_real_model,
         "llm": settings.model_llm,
+        "vision": settings.vision_model,
         "embedding": settings.model_embedding,
+        "embedding_dim": settings.embedding_dim,
         "rerank": settings.model_rerank,
     }

@@ -7,6 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.storage.models import Document, KnowledgeBase, KnowledgeUnit
 
+_SOURCE_RANK = {"manual": 0, "llm": 1, "extracted": 2}
+
 
 def normalize_keywords(raw: Any) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
@@ -17,7 +19,7 @@ def normalize_keywords(raw: Any) -> list[dict[str, Any]]:
             weight, source = 1.0, "extracted"
         else:
             keyword = str(item.get("keyword") or "").strip()
-            weight = float(item.get("weight") or 1.0)
+            weight = float(item.get("weight") if item.get("weight") is not None else 1.0)
             source = str(item.get("source") or "manual")
         key = keyword.lower()
         if not keyword or key in seen:
@@ -25,6 +27,38 @@ def normalize_keywords(raw: Any) -> list[dict[str, Any]]:
         seen.add(key)
         items.append({"keyword": keyword, "weight": weight, "source": source})
     return items
+
+
+def merge_keyword_lists(*groups: Any) -> list[dict[str, Any]]:
+    """合并去重：manual > llm > extracted，避免启发式 concepts 盖掉千问/人工标注。"""
+    merged: list[dict[str, Any]] = []
+    for group in groups:
+        merged.extend(normalize_keywords(group))
+    merged.sort(key=lambda item: _SOURCE_RANK.get(str(item.get("source") or ""), 9))
+    return normalize_keywords(merged)
+
+
+def has_protected_keywords(keywords: list[dict[str, Any]] | None) -> bool:
+    return any(item.get("source") in {"llm", "manual"} for item in keywords or [])
+
+
+def has_llm_meta(meta: dict[str, Any] | None) -> bool:
+    data = meta or {}
+    return str(data.get("annotated_by") or data.get("source") or "") == "llm"
+
+
+def should_fill_keywords(raw_keywords: Any, keywords: list[dict[str, Any]], force: bool) -> bool:
+    """已有 llm/manual 则不从 unit.concepts 覆盖；force 重建同样保留。"""
+    if has_protected_keywords(keywords):
+        return False
+    return raw_keywords is None or (force and not keywords)
+
+
+def should_fill_meta(raw_meta: Any, meta: dict[str, Any], force: bool) -> bool:
+    """千问已写 annotated_by=llm 时不覆盖；force 重建同样保留。"""
+    if has_llm_meta(meta):
+        return False
+    return raw_meta is None or (force and not meta)
 
 
 def document_index_body(doc: Document) -> dict[str, Any]:
@@ -87,8 +121,8 @@ async def ensure_document_index(
     keywords = normalize_keywords(raw_keywords)
     meta = dict(raw_meta or {})
     changed = False
-    fill_keywords = raw_keywords is None or (force and not keywords)
-    fill_meta = raw_meta is None or (force and not meta)
+    fill_keywords = should_fill_keywords(raw_keywords, keywords, force)
+    fill_meta = should_fill_meta(raw_meta, meta, force)
     if fill_keywords:
         units = (
             await session.execute(select(KnowledgeUnit).where(KnowledgeUnit.document_id == doc.id))

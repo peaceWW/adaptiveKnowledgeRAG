@@ -47,6 +47,22 @@ ROLE_CATALOG: list[dict] = [
 ]
 
 
+ROLE_LABELS = {
+    "definition": "概念定义", "explanation": "解释说明", "principle": "技术原理", "classification": "分类体系",
+    "related_concept": "相关概念", "background": "背景知识", "summary": "摘要总结", "constraint": "约束条件",
+    "parameter": "参数指标", "rule": "设计规则", "exception": "例外情况", "formula": "公式", "requirement": "规格需求",
+    "obligation": "法定义务", "prohibition": "禁止事项", "clause": "条款", "example": "应用示例", "reference": "参考文献",
+    "solution": "解决方案", "procedure": "操作流程", "step": "执行步骤", "actor": "责任角色", "best_practice": "最佳实践",
+    "comparison": "方案对比", "root_cause": "根因分析", "symptom": "故障现象", "prevention": "预防措施", "impact": "影响范围",
+    "environment": "运行环境", "api_input": "接口入参", "api_output": "接口出参", "error_code": "错误码", "metric": "性能指标",
+    "limitation": "能力边界", "interface": "接口说明", "sla": "服务时效", "checklist": "检查清单", "warning": "风险警告",
+    "assumption": "前提假设", "scope": "适用范围", "timeline": "时间线", "decision": "决策记录", "consequence": "后果影响",
+}
+CATEGORY_LABELS = {"CORE CONCEPTS": "基础概念", "RULES & CONSTRAINTS": "规则与约束", "APPLICATION & CONTEXT": "应用与流程",
+                   "TECHNICAL DETAILS": "技术细节", "PROCESS & LEGAL": "管理与合规", "CUSTOM": "自定义"}
+for _role in ROLE_CATALOG:
+    _role["label"] = ROLE_LABELS.get(_role["key"], _role["label"])
+
 PREVIEW_SAMPLE = """CDC（Clock Domain Crossing，跨时钟域）是指数字电路中信号从一个时钟域传递到另一个异步时钟域的过程。
 CDC 中产生亚稳态的主要原因是数据在接收时钟沿附近发生变化。
 单 bit 信号推荐使用双触发器同步器。多 bit 数据推荐 Handshake 或 Async FIFO。

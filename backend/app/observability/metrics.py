@@ -4,12 +4,14 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor
 
 from app.config import get_settings
+from app.observability.pipeline_log import configure_pipeline_logging
 
 _initialized = False
 
 
 def init_observability(service_name: str = "adaptive-knowledge-rag") -> None:
     global _initialized
+    configure_pipeline_logging()
     if _initialized:
         return
     provider = TracerProvider(resource=Resource.create({"service.name": service_name}))

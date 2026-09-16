@@ -4,7 +4,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import KnowledgeRoleCreate, StrategyCreate, StrategyPreviewRequest, StrategyUpdate
 from app.domain.registry import registry
-from app.domain.roles import PREVIEW_SAMPLE, ROLE_CATALOG
+from app.domain.roles import PREVIEW_SAMPLE, ROLE_CATALOG, ROLE_LABELS, CATEGORY_LABELS
+from app.domain.extraction_policy import normalized_policy
 from app.storage.db import get_session
 from app.storage.models import EvaluationRun, KnowledgeRole, KnowledgeStrategy
 
@@ -15,8 +16,8 @@ def _role_item(role: KnowledgeRole) -> dict:
     return {
         "id": role.id,
         "key": role.key,
-        "label": role.label,
-        "category": role.category,
+        "label": ROLE_LABELS.get(role.key, role.label) if role.is_builtin else role.label,
+        "category": CATEGORY_LABELS.get(role.category, role.category),
         "description": role.description,
         "color": role.color,
         "keywords": role.keywords or [],
@@ -32,6 +33,7 @@ def _serialize(strategy: KnowledgeStrategy) -> dict:
         "knowledge_type": strategy.knowledge_type,
         "roles": strategy.roles,
         "chunk_policy": strategy.chunk_policy,
+        "extraction_policy": normalized_policy(strategy.extraction_policy),
         "max_context_tokens": strategy.max_context_tokens,
         "retrieval_policy": strategy.retrieval_policy,
         "completeness_policy": strategy.completeness_policy,
@@ -47,9 +49,7 @@ def _slug(value: str) -> str:
 
 
 async def _ensure_roles(session: AsyncSession) -> None:
-    existing = await session.execute(select(KnowledgeRole).limit(1))
-    if existing.scalar_one_or_none():
-        return
+    existing = set((await session.execute(select(KnowledgeRole.key))).scalars().all())
     session.add_all(
         [
             KnowledgeRole(
@@ -62,6 +62,7 @@ async def _ensure_roles(session: AsyncSession) -> None:
                 is_builtin=True,
             )
             for item in ROLE_CATALOG
+            if item["key"] not in existing
         ]
     )
     await session.commit()
@@ -116,13 +117,16 @@ async def create_strategy(payload: StrategyCreate, session: AsyncSession = Depen
     source = None
     if payload.clone_id:
         source = await session.get(KnowledgeStrategy, payload.clone_id)
+        if not source:
+            raise HTTPException(404, "被复制的策略不存在")
     roles = payload.roles or (source.roles if source else ["definition", "explanation", "principle", "constraint", "example"])
     strategy = KnowledgeStrategy(
-        name=payload.name,
+        name=payload.name.strip(),
         version=payload.version or (source.version if source else "V1"),
         knowledge_type=payload.knowledge_type or (source.knowledge_type if source else "technical_concept"),
         roles=list(roles),
         chunk_policy=payload.chunk_policy or (source.chunk_policy if source else "semantic_unit"),
+        extraction_policy=payload.extraction_policy.model_dump() if payload.extraction_policy else normalized_policy(source.extraction_policy if source else None),
         max_context_tokens=source.max_context_tokens if source else 2000,
         retrieval_policy=dict(source.retrieval_policy) if source else {},
         completeness_policy=payload.completeness_policy
@@ -130,6 +134,7 @@ async def create_strategy(payload: StrategyCreate, session: AsyncSession = Depen
         relation_schema=dict(source.relation_schema) if source else {},
         status="draft",
     )
+    await _validate_strategy(session, strategy.name, strategy.roles, strategy.completeness_policy, strategy.extraction_policy)
     session.add(strategy)
     await session.commit()
     await session.refresh(strategy)
@@ -238,9 +243,31 @@ async def update_strategy(
     strategy = await session.get(KnowledgeStrategy, strategy_id)
     if not strategy:
         raise HTTPException(404, "strategy not found")
-    data = payload.model_dump(exclude_unset=True)
+    data = payload.model_dump(exclude_unset=True, exclude_none=True)
+    if "name" in data:
+        data["name"] = data["name"].strip()
+    await _validate_strategy(session, data.get("name", strategy.name), data.get("roles", strategy.roles),
+                             data.get("completeness_policy", strategy.completeness_policy),
+                             data.get("extraction_policy", normalized_policy(strategy.extraction_policy)))
     for key, value in data.items():
         setattr(strategy, key, value)
     await session.commit()
     await session.refresh(strategy)
     return _serialize(strategy)
+
+
+async def _validate_strategy(session, name, roles, completeness, policy):
+    if not name:
+        raise HTTPException(422, "策略名称不能为空")
+    await _ensure_roles(session)
+    known = set((await session.execute(select(KnowledgeRole.key))).scalars().all())
+    if set(roles or []) - known:
+        raise HTTPException(422, "存在未知知识类别，请先添加自定义类别")
+    if policy.get("text") and not (set(roles or []) - {"formula", "reference"}):
+        raise HTTPException(422, "启用文本提取时，请至少选择一种文本知识类别")
+    try:
+        threshold = float((completeness or {}).get("minimum_coverage", 0.9))
+        if not 0 <= threshold <= 1:
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise HTTPException(422, "完整性阈值必须在 0 到 1 之间")

@@ -1,7 +1,12 @@
 from datetime import datetime, timedelta
 from time import perf_counter
+import asyncio
+import json
+import logging
+from contextlib import suppress
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -145,6 +150,10 @@ async def chat(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(current_user),
 ):
+    return await _execute_chat(payload, session, user)
+
+
+async def _execute_chat(payload, session, user, emit=None):
     stores = get_stores()
     chat_session = None
     if payload.session_id:
@@ -155,8 +164,18 @@ async def chat(
         chat_session = ChatSession(user_id=user.id, title=_title_from_query(payload.query))
         session.add(chat_session)
         await session.flush()
+        if emit:
+            await session.commit()
     started = perf_counter()
     workflow = QueryWorkflow(session, stores.gateway, stores.qdrant, stores.es, stores.neo4j)
+    workflow.emit = emit
+    if emit:
+        await emit("session", {"session_id": chat_session.id})
+    previous = (await session.execute(
+        select(QueryTrace).where(QueryTrace.session_id == chat_session.id)
+        .order_by(QueryTrace.created_at.desc()).limit(6)
+    )).scalars().all()
+    workflow.history = [{"query": t.query, "answer": t.answer} for t in reversed(previous)]
     result = await workflow.run(payload.query, payload.kb_id, user.id)
     elapsed_ms = int((perf_counter() - started) * 1000)
     if result.get("trace_id"):
@@ -177,6 +196,54 @@ async def chat(
     plan["search_strategy"] = payload.search_strategy
     body["plan"] = plan
     return body
+
+
+@router.post("/stream")
+async def chat_stream(
+    payload: ChatRequest,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    if payload.session_id:
+        owned = await session.get(ChatSession, payload.session_id)
+        if not owned or owned.user_id != user.id:
+            raise HTTPException(404, "session not found")
+
+    async def events():
+        queue = asyncio.Queue()
+
+        async def emit(event, data):
+            await queue.put((event, data))
+
+        async def produce():
+            try:
+                body = await _execute_chat(payload, session, user, emit)
+                await emit("done", body)
+            except Exception:
+                await session.rollback()
+                logging.getLogger(__name__).exception("Chat stream failed")
+                await emit("error", {"message": "回答生成失败，请重试。"})
+
+        task = asyncio.create_task(produce())
+        try:
+            yield ": connected\n\n"
+            while True:
+                try:
+                    event, data = await asyncio.wait_for(queue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": heartbeat\n\n"
+                    continue
+                yield f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+                if event in {"done", "error"}:
+                    break
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+    })
 
 
 @router.get("/traces/{trace_id}")

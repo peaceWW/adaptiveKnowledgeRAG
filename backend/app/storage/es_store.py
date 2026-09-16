@@ -8,6 +8,8 @@ from typing import Any
 from elasticsearch import AsyncElasticsearch
 
 from app.config import get_settings
+from app.domain.enums import RETRIEVAL_LIFECYCLES
+from app.retrieval.query_terms import query_terms, retrieval_query
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +95,8 @@ class ElasticStore:
         await self.delete(f"doc:{doc_id}")
 
     def _query_tokens(self, query: str) -> list[str]:
-        return [tok.lower() for tok in query.split() if len(tok) >= 2] or [query.lower()]
+        terms = [tok.lower() for tok in query_terms(query)]
+        return terms or [query.lower()]
 
     def _local_blob(self, body: dict[str, Any]) -> str:
         parts = [
@@ -131,7 +134,7 @@ class ElasticStore:
                         "must": [
                             {
                                 "multi_match": {
-                                    "query": query,
+                                    "query": retrieval_query(query),
                                     "fields": ["keywords^3", "filename^2", "title", "content"],
                                 }
                             }
@@ -162,21 +165,20 @@ class ElasticStore:
         for unit_id, body in self._local.items():
             if body.get("index_kind") == "document":
                 continue
-            if lifecycle and body.get("lifecycle") not in {lifecycle, "APPROVED", "PUBLISHED"}:
+            allowed = RETRIEVAL_LIFECYCLES if lifecycle in RETRIEVAL_LIFECYCLES else {lifecycle}
+            if lifecycle and body.get("lifecycle") not in allowed:
                 continue
             if kb_id and body.get("kb_id") != kb_id:
                 continue
-            if roles and body.get("semantic_role") not in roles:
-                continue
             if any(tok in self._local_blob(body) for tok in tokens):
-                local_hits.append({"id": unit_id, "score": 1.0, "source": body})
+                score = 1.2 if roles and body.get("semantic_role") in roles else 1.0
+                local_hits.append({"id": unit_id, "score": score, "source": body})
         if not self.client or not self.available:
             return local_hits[:limit]
-        filters: list[dict[str, Any]] = [{"term": {"lifecycle": lifecycle}}]
+        allowed = list(RETRIEVAL_LIFECYCLES) if lifecycle in RETRIEVAL_LIFECYCLES else [lifecycle]
+        filters: list[dict[str, Any]] = [{"terms": {"lifecycle": allowed}}]
         if kb_id:
             filters.append({"term": {"kb_id": kb_id}})
-        if roles:
-            filters.append({"terms": {"semantic_role": roles}})
         try:
             result = await self.client.search(
                 index=self.index,
@@ -186,7 +188,7 @@ class ElasticStore:
                         "must": [
                             {
                                 "multi_match": {
-                                    "query": query,
+                                    "query": retrieval_query(query),
                                     "fields": ["title^3", "content", "concepts^2", "keywords^3", "filename"],
                                 }
                             }

@@ -16,6 +16,7 @@ from qdrant_client.http.models import (
 )
 
 from app.config import get_settings
+from app.domain.enums import RETRIEVAL_LIFECYCLES
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ class QdrantStore:
             self.available = False
 
     def ensure_collection(self) -> None:
+        """创建 collection；已存在时只告警向量维与 EMBEDDING_DIM 不一致，不自动删库。"""
         if not self.client:
             return
         name = self.settings.qdrant_collection
@@ -62,6 +64,32 @@ class QdrantStore:
                     distance=Distance.COSINE,
                 ),
             )
+            return
+        size = self._collection_vector_size(name)
+        if size and size != self.settings.embedding_dim:
+            logger.warning(
+                "Qdrant collection %s vector size is %s, EMBEDDING_DIM=%s; recreate the collection after changing embedding models",
+                name,
+                size,
+                self.settings.embedding_dim,
+            )
+
+    def _collection_vector_size(self, name: str) -> int | None:
+        """读已有 collection 的向量维，换千问 embedding 后若不一致需要重建。"""
+        try:
+            info = self.client.get_collection(name)
+            params = info.config.params.vectors
+            if hasattr(params, "size") and params.size:
+                return int(params.size)
+            if isinstance(params, dict) and params:
+                first = next(iter(params.values()))
+                if hasattr(first, "size") and first.size:
+                    return int(first.size)
+                if isinstance(first, dict) and first.get("size"):
+                    return int(first["size"])
+        except Exception as exc:
+            logger.warning("Could not read Qdrant collection vector size: %s", exc)
+        return None
 
     def upsert(self, unit_id: str, vector: list[float], payload: dict[str, Any]) -> None:
         self._memory[unit_id] = (vector, payload)
@@ -107,13 +135,12 @@ class QdrantStore:
         extra_filters: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
         assert self.client is not None
+        lifecycles = list(RETRIEVAL_LIFECYCLES) if lifecycle in RETRIEVAL_LIFECYCLES else [lifecycle]
         must: list[FieldCondition] = [
-            FieldCondition(key="lifecycle", match=MatchValue(value=lifecycle)),
+            FieldCondition(key="lifecycle", match=MatchAny(any=list(dict.fromkeys(lifecycles)))),
         ]
         if kb_id:
             must.append(FieldCondition(key="kb_id", match=MatchValue(value=kb_id)))
-        if roles:
-            must.append(FieldCondition(key="semantic_role", match=MatchAny(any=roles)))
         if extra_filters:
             for key, value in extra_filters.items():
                 if value is None:
@@ -129,7 +156,7 @@ class QdrantStore:
             limit=limit,
             with_payload=True,
         )
-        return [
+        hits = [
             {
                 "id": str(hit.id),
                 "score": float(hit.score or 0),
@@ -137,6 +164,7 @@ class QdrantStore:
             }
             for hit in results
         ]
+        return _boost_roles(hits, roles)
 
     def _memory_search(
         self,
@@ -154,18 +182,31 @@ class QdrantStore:
             if not isinstance(allowed_kbs, list):
                 allowed_kbs = [allowed_kbs]
         for unit_id, (vec, payload) in self._memory.items():
-            if payload.get("lifecycle") not in {lifecycle, "APPROVED"}:
+            if payload.get("lifecycle") not in (
+                RETRIEVAL_LIFECYCLES if lifecycle in RETRIEVAL_LIFECYCLES else {lifecycle}
+            ):
                 continue
             if kb_id and payload.get("kb_id") != kb_id:
                 continue
             if allowed_kbs and payload.get("kb_id") not in allowed_kbs:
                 continue
-            if roles and payload.get("semantic_role") not in roles:
-                continue
             score = _cosine(vector, vec)
             scored.append({"id": unit_id, "score": score, "payload": payload})
+        scored = _boost_roles(scored, roles)
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:limit]
+
+
+def _boost_roles(hits: list[dict[str, Any]], roles: list[str] | None, weight: float = 1.2) -> list[dict[str, Any]]:
+    if not roles:
+        return hits
+    wanted = set(roles)
+    for hit in hits:
+        role = (hit.get("payload") or {}).get("semantic_role")
+        if role in wanted:
+            hit["score"] = float(hit.get("score") or 0) * weight
+    hits.sort(key=lambda item: item.get("score") or 0, reverse=True)
+    return hits
 
 
 def _cosine(a: list[float], b: list[float]) -> float:

@@ -9,7 +9,7 @@ from app.config import get_settings
 from app.deps import AppStores
 from app.model_gateway.gateway import ModelGateway
 from app.observability.metrics import init_observability
-from app.seed import seed_if_empty
+from app.seed import seed_if_empty, sync_prompt_templates
 from app.storage import db as storage_db
 from app.storage.es_store import ElasticStore
 from app.storage.minio_store import MinioStore
@@ -33,6 +33,7 @@ async def lifespan(app: FastAPI):
     deps.stores = stores
     async with storage_db.SessionLocal() as session:
         await seed_if_empty(session, stores.gateway, stores.qdrant, stores.es, stores.neo4j)
+        await sync_prompt_templates(session)
     yield
     await stores.es.close()
     stores.neo4j.close()
@@ -41,10 +42,12 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title="Adaptive Knowledge RAG", version="0.1.0", lifespan=lifespan)
+    cors_origins = settings.cors_origin_list
+    allow_credentials = "*" not in cors_origins
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.cors_origin_list,
-        allow_credentials=True,
+        allow_origins=cors_origins,
+        allow_credentials=allow_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
     )

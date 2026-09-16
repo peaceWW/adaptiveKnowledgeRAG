@@ -96,7 +96,19 @@ onBeforeUnmount(() => {
   window.removeEventListener("resize", draw);
 });
 
-defineExpose({ draw });
+function focusNode(id: string) {
+  const el = canvas.value;
+  const node = el?.querySelector(`[data-id="${CSS.escape(id)}"]`) as HTMLElement | null;
+  if (!el || !node) return;
+  const box = el.getBoundingClientRect();
+  const target = node.getBoundingClientRect();
+  el.scrollTo({
+    left: Math.max(0, el.scrollLeft + target.left - box.left - 24),
+    top: Math.max(0, el.scrollTop + target.top - box.top + target.height / 2 - el.clientHeight / 2),
+  });
+}
+
+defineExpose({ draw, focusNode });
 </script>
 
 <style scoped>
