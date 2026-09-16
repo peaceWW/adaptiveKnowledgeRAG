@@ -190,6 +190,11 @@ class QdrantStore:
                 continue
             if allowed_kbs and payload.get("kb_id") not in allowed_kbs:
                 continue
+            extra_kind = extra_filters.get("kind") if extra_filters else None
+            if extra_kind:
+                accepted = extra_kind if isinstance(extra_kind, list) else [extra_kind]
+                if payload.get("kind") not in accepted:
+                    continue
             score = _cosine(vector, vec)
             scored.append({"id": unit_id, "score": score, "payload": payload})
         scored = _boost_roles(scored, roles)

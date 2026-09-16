@@ -68,6 +68,8 @@
               <div v-for="item in pagedEvidence" :key="item.id" class="evidence-card">
                 <div>
                   <a-tag :color="item.lifecycle === 'AI_PROCESSED' ? 'orange' : 'blue'">{{ roleLabel(item.role) }}</a-tag>
+                  <a-tag v-if="item.kind === 'figure' || item.image_key" color="purple">图</a-tag>
+                  <a-tag v-else-if="item.kind === 'equation' || item.role === 'formula'" color="cyan">公式</a-tag>
                   <small v-if="item.lifecycle === 'AI_PROCESSED'">AI 抽取 · 待核对</small>
                 </div>
                 <button class="evidence-title-button" type="button" @click="openEvidence(item)">{{ item.title }}</button>
@@ -140,6 +142,7 @@ import PdfSourceViewer from "../components/PdfSourceViewer.vue";
 import DocumentAsset from "../components/DocumentAsset.vue";
 import { renderAnswer } from "../answer";
 import { roleLabels } from "../knowledge";
+import { sortEvidence } from "../evidenceOrder";
 
 const PALETTE = ["blue", "green", "purple", "cyan"];
 const ICONS: Record<string, string> = {
@@ -218,7 +221,7 @@ const root = computed(() => {
   };
 });
 
-const evidenceItems = computed(() => (detail.value?.quotes || []).map(toEvidence));
+const evidenceItems = computed(() => sortEvidence((detail.value?.quotes || []).map(toEvidence)));
 const filteredEvidence = computed(() =>
   evidenceItems.value.filter((item: any) => evidenceFilter.value === "all" || roleGroups[evidenceFilter.value]?.includes(item.role)),
 );
@@ -257,6 +260,8 @@ function toEvidence(quote: any) {
     section: quote.section || "",
     image_key: quote.image_key || "",
     image_url: quote.image_url || "",
+    kind: quote.kind || "",
+    latex: quote.latex || "",
   };
 }
 

@@ -1,16 +1,17 @@
 <template>
   <div class="asset-frame">
     <a-spin v-if="loading" />
-    <a-image v-else-if="url" :src="url" :alt="alt" :style="{ maxWidth: '100%' }" />
+    <a-image v-else-if="url && !error" :src="url" :preview="preview" :alt="alt" :style="{ maxWidth: '100%' }" @error="error = '图片加载失败，请查看引用来源。'" />
     <a-alert v-else type="info" :message="error || '未保存对应截图，请定位到 PDF 原稿核对。'" show-icon />
-    <div v-if="publicUrl" class="asset-url">图片地址：{{ publicUrl }}</div>
+    <div v-if="showUrl && publicUrl" class="asset-url">图片地址：{{ publicUrl }}</div>
   </div>
 </template>
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import axios from 'axios';
 import { api } from '../api';
-const props = defineProps<{ documentId: string; imageKey?: string; imageUrl?: string; alt: string }>();
+const props = withDefaults(defineProps<{ documentId: string; imageKey?: string; imageUrl?: string; alt: string; preview?: boolean; showUrl?: boolean }>(), { showUrl: true, preview: true });
+const preview = computed(() => props.preview !== false);
 const url = ref(''), loading = ref(false), error = ref('');
 let controller: AbortController | undefined, version = 0;
 const publicUrl = computed(() => {

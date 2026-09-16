@@ -39,6 +39,16 @@ async def init_db() -> None:
 def _migrate_schema(sync_conn) -> None:
     inspector = inspect(sync_conn)
     tables = inspector.get_table_names()
+    additions = {
+        "golden_case": {"evaluation_config": "JSON"},
+        "evaluation_run": {"status": "VARCHAR(32) DEFAULT 'completed'", "owner_id": "VARCHAR(36)", "revision": "INTEGER DEFAULT 0", "config": "JSON"},
+    }
+    for table, fields in additions.items():
+        if table in tables:
+            existing = {column["name"] for column in inspector.get_columns(table)}
+            for field, sql_type in fields.items():
+                if field not in existing:
+                    sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {field} {sql_type}"))
     if "knowledge_strategy" in tables:
         strategy_columns = {col["name"] for col in inspector.get_columns("knowledge_strategy")}
         if "extraction_policy" not in strategy_columns:

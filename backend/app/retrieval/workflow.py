@@ -9,12 +9,22 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.completeness.checker import CompletenessChecker
-from app.domain.enums import QueryIntent, RelationType, SemanticRole, RETRIEVAL_LIFECYCLES
+from app.domain.enums import QueryIntent, RelationType, RETRIEVAL_LIFECYCLES
 from app.domain.registry import registry
 from app.domain.strategy import QueryContext
 from app.model_gateway.gateway import ModelGateway
 from app.observability.pipeline_log import hit_digest, step as pipeline_step
 from app.prompts.loader import load_prompt
+from app.retrieval.evidence_order import (
+    SIBLING_EXPAND_CAP,
+    adjust_kind_completeness,
+    cap_evidence_hits,
+    evidence_label,
+    infer_evidence_types,
+    normalize_kind,
+    order_context_hits,
+    split_missing_roles_and_kinds,
+)
 from app.retrieval.fusion import rrf_fuse
 from app.retrieval.planner import RetrievalPlanner
 from app.storage.es_store import ElasticStore
@@ -44,7 +54,7 @@ EXPAND_RELATIONS = {
     RelationType.BELONGS_TO.value,
 }
 DEFAULT_UNDERSTAND_PROMPT = """你是芯片设计工程师的检索规划助手。禁止直接回答。输出 JSON：
-{"domain":"semiconductor","topics":[],"intent":"definition","risk":"medium"}
+{"domain":"semiconductor","topics":[],"intent":"definition","risk":"medium","evidence_types":["figure","equation","text"]}
 """
 DEFAULT_ANSWER_PROMPT = "你是芯片设计工程师助手。只能依据给定 Knowledge Unit 作答，必须引用角色与来源。不得编造文档中不存在的约束或公式。"
 
@@ -56,6 +66,7 @@ class QueryState(TypedDict, total=False):
     understanding: dict[str, Any]
     plan: dict[str, Any]
     hits: list[dict[str, Any]]
+    ranked_hits: list[dict[str, Any]]
     completeness: dict[str, Any]
     answer: str
     citations: list[dict[str, Any]]
@@ -76,6 +87,7 @@ class QueryWorkflow:
         self.session = session
         self.emit = None
         self.history = []
+        self.evaluation_strategy: dict | None = None
         self.gateway = gateway
         self.qdrant = qdrant
         self.es_store = es_store
@@ -107,11 +119,15 @@ class QueryWorkflow:
         )
         intent = _parse_intent(query, parsed.get("intent"))
         topics = parsed.get("topics") or _extract_topics(query)
+        evidence_types = parsed.get("evidence_types") or infer_evidence_types(query, intent.value)
+        if not isinstance(evidence_types, list) or not evidence_types:
+            evidence_types = infer_evidence_types(query, intent.value)
         understanding = {
             "domain": parsed.get("domain") or "semiconductor",
             "topics": topics,
             "intent": intent.value,
             "risk": parsed.get("risk") or ("high" if intent in {QueryIntent.SOLUTION, QueryIntent.RISK} else "medium"),
+            "evidence_types": [str(item) for item in evidence_types if item],
         }
         pipeline_step(
             "retrieve",
@@ -130,6 +146,8 @@ class QueryWorkflow:
         knowledge_type = "technical_concept"
         if kb and kb.strategy:
             knowledge_type = kb.strategy.knowledge_type
+        if self.evaluation_strategy:
+            knowledge_type = self.evaluation_strategy["knowledge_type"]
         strategy = registry.get(knowledge_type)
         ctx = QueryContext(
             query=state["query"],
@@ -137,20 +155,38 @@ class QueryWorkflow:
             domain=understanding["domain"],
             intent=intent,
             topics=understanding["topics"],
+            evidence_types=list(understanding.get("evidence_types") or []),
         )
         plan = strategy.plan(ctx)
         configured = await self.planner.load_steps(intent.value)
+        required_kinds = list(plan.required_kinds or understanding.get("evidence_types") or [])
+        expand_kinds = [kind for kind in required_kinds if kind in {"figure", "equation", "table"}] or [
+            "figure",
+            "equation",
+            "table",
+        ]
         plan_payload = {
             "intent": plan.intent.value,
             "topics": plan.topics,
             "required_roles": [r.value for r in plan.required_roles],
+            "required_kinds": required_kinds,
             "graph_expand": plan.graph_expand,
             "search_strategy": plan.search_strategy,
             "completeness_check": plan.completeness_check,
             "steps": configured or plan.steps,
             "knowledge_type": knowledge_type,
-            "expand_kinds": ["figure", "equation", "table"],
+            "expand_kinds": expand_kinds,
         }
+        if self.evaluation_strategy:
+            config = self.evaluation_strategy
+            roles = (config.get("retrieval_policy") or {}).get(intent.value)
+            if isinstance(roles, list):
+                plan_payload["required_roles"] = [str(role) for role in roles]
+            policy = config.get("completeness_policy") or {}
+            plan_payload["completeness_threshold"] = float(policy.get("minimum_coverage", .8))
+            plan_payload["secondary_retrieval"] = policy.get("low_coverage", "secondary_retrieval") == "secondary_retrieval"
+            plan_payload["strategy_id"] = config.get("id")
+            plan_payload["strategy_version"] = config.get("version")
         pipeline_step(
             "retrieve",
             "plan",
@@ -243,6 +279,9 @@ class QueryWorkflow:
             reranked = [_hit_from_unit(unit, 0.5, via="fused") for unit in unit_list[:12]]
 
         expanded = await self._expand_neighbors(reranked, allowed_kbs, plan.get("expand_kinds") or [])
+        expanded = order_context_hits(
+            expanded, state["query"], plan.get("intent") or "", plan.get("required_kinds") or []
+        )
         retrieval = {
             "keyword": len(keyword_hits),
             "vector": len(vector_hits),
@@ -276,6 +315,7 @@ class QueryWorkflow:
         return {
             **state,
             "hits": expanded,
+            "ranked_hits": reranked,
             "retrieval": retrieval,
         }
 
@@ -287,20 +327,48 @@ class QueryWorkflow:
             kb_id=state.get("kb_id"),
             intent=QueryIntent(plan["intent"]),
             topics=plan.get("topics") or [],
+            evidence_types=list(plan.get("required_kinds") or []),
         )
-        result = await asyncio.to_thread(self.checker.check,
+        result = await asyncio.to_thread(
+            self.checker.check,
             ctx,
             plan.get("required_roles") or [],
             [h["title"] for h in hits],
-            [h["semantic_role"] for h in hits],
+            [h.get("semantic_role") for h in hits],
+            threshold=plan.get("completeness_threshold", .8),
+            retrieved_kinds=[h.get("kind") or "" for h in hits],
         )
-        if result.need_secondary_retrieval and result.missing:
+        result.missing, result.need_secondary_retrieval, result.secondary_query = adjust_kind_completeness(
+            state["query"],
+            hits,
+            result.missing,
+            result.need_secondary_retrieval,
+            result.secondary_query,
+            plan.get("required_kinds") or [],
+        )
+        if result.need_secondary_retrieval and result.missing and plan.get("secondary_retrieval", True):
             secondary_query = result.secondary_query or state["query"]
             missing_before = list(result.missing)
             extra_vec = (await asyncio.to_thread(self.gateway.embed, [secondary_query]))[0]
-            extra = await asyncio.to_thread(self.qdrant.search,extra_vec, limit=10, kb_id=state.get("kb_id"), roles=result.missing)
-            existing = {h["id"] for h in hits}
+            role_missing, kind_missing = split_missing_roles_and_kinds(result.missing)
+            extra_filters: dict[str, Any] = {}
             allowed_kbs = await self._allowed_kb_ids(state.get("user_id"), state.get("kb_id"))
+            if not state.get("kb_id") and allowed_kbs:
+                extra_filters["kb_id"] = allowed_kbs
+            # 缺图时按 kind=figure 过滤，禁止把 figure 当 semantic_role 传给 Qdrant
+            if "figure" in kind_missing:
+                extra_filters["kind"] = "figure"
+            elif "equation" in kind_missing:
+                extra_filters["kind"] = "equation"
+            extra = await asyncio.to_thread(
+                self.qdrant.search,
+                extra_vec,
+                limit=10,
+                kb_id=state.get("kb_id"),
+                roles=role_missing or None,
+                extra_filters=extra_filters or None,
+            )
+            existing = {h["id"] for h in hits}
             for item in extra:
                 if item["id"] in existing:
                     continue
@@ -309,11 +377,22 @@ class QueryWorkflow:
                     continue
                 hits.append(_hit_from_unit(unit, item["score"], via="secondary"))
             hits = await self._expand_neighbors(hits, allowed_kbs, plan.get("expand_kinds") or [])
-            result = await asyncio.to_thread(self.checker.check,
+            result = await asyncio.to_thread(
+                self.checker.check,
                 ctx,
                 plan.get("required_roles") or [],
                 [h["title"] for h in hits],
-                [h["semantic_role"] for h in hits],
+                [h.get("semantic_role") for h in hits],
+                threshold=plan.get("completeness_threshold", .8),
+                retrieved_kinds=[h.get("kind") or "" for h in hits],
+            )
+            result.missing, result.need_secondary_retrieval, result.secondary_query = adjust_kind_completeness(
+                state["query"],
+                hits,
+                result.missing,
+                result.need_secondary_retrieval,
+                result.secondary_query,
+                plan.get("required_kinds") or [],
             )
             pipeline_step(
                 "retrieve",
@@ -321,6 +400,9 @@ class QueryWorkflow:
                 inputs={"secondary_query": secondary_query, "missing_before": missing_before},
                 result={"hit_count": len(hits), "score": result.completeness_score, "hits": hit_digest(hits)},
             )
+        hits = order_context_hits(
+            hits, state["query"], plan.get("intent") or "", plan.get("required_kinds") or []
+        )
         completeness = {
             "required_knowledge": result.required_knowledge,
             "covered": result.covered,
@@ -342,21 +424,31 @@ class QueryWorkflow:
         }
 
     async def answer(self, state: QueryState) -> QueryState:
-        hits = _order_context_hits(state.get("hits") or [])
+        plan = state.get("plan") or {}
+        hits = cap_evidence_hits(
+            order_context_hits(
+                state.get("hits") or [],
+                state["query"],
+                plan.get("intent") or "",
+                plan.get("required_kinds") or [],
+            )
+        )
         completeness = state.get("completeness") or {}
         doc_cache: dict[str, Document] = {}
         context_blocks = []
         citations = []
-        for hit in hits[:12]:
-            kind = hit.get("kind") or ""
-            label = f"[{hit['semantic_role']}" + (f"/{kind}" if kind else "") + "]"
+        for hit in hits:
+            kind = normalize_kind(hit)
+            label = f"{evidence_label(kind)} [{hit.get('semantic_role') or ''}" + (f"/{kind}" if kind else "") + "]"
             extra = ""
-            if hit.get("image_url") or hit.get("image_key"):
-                extra = f"\n相关图: {hit.get('title')} image_url={hit.get('image_url') or ''} image_key={hit.get('image_key') or ''}"
+            if kind == "figure" and (hit.get("image_url") or hit.get("image_key")):
+                extra = f"\n正文图片占位符（独占一行，原样输出）：[[figure:{hit['id']}]]"
+            elif kind == "equation" and hit.get("latex"):
+                extra = f"\nLaTeX: {hit.get('latex')}"
             context_blocks.append(
                 f"{label} {hit['title']}\n{hit['content']}{extra}\n来源: {hit.get('source_chapter')} {hit.get('source_section')} p.{hit.get('source_page')}"
             )
-            doc_title, doi = "", ""
+            doc_title, doi, filename = "", "", ""
             doc_id = hit.get("document_id")
             if doc_id:
                 if doc_id not in doc_cache:
@@ -366,7 +458,8 @@ class QueryWorkflow:
                     meta = (doc.index_meta or {}) if hasattr(doc, "index_meta") else {}
                     structure_meta = ((doc.structure or {}).get("metadata") if doc.structure else {}) or {}
                     doi = str(meta.get("doi") or structure_meta.get("doi") or "")
-                    doc_title = str(meta.get("title") or structure_meta.get("title") or doc.filename)
+                    filename = str(doc.filename or "")
+                    doc_title = str(meta.get("title") or structure_meta.get("title") or filename)
             citations.append(
                 {
                     "knowledge_id": hit["id"],
@@ -377,11 +470,14 @@ class QueryWorkflow:
                     "page": hit.get("source_page"),
                     "section": hit.get("source_section"),
                     "anchor": hit.get("anchor") or "",
+                    "latex": hit.get("latex") or "",
+                    "content": (hit.get("content") or "")[:2000],
                     "image_key": hit.get("image_key") or "",
                     "image_url": hit.get("image_url") or "",
                     "doi": doi,
                     "document_id": doc_id,
                     "document_title": doc_title,
+                    "filename": filename,
                     "via": hit.get("via") or "",
                 }
             )
@@ -420,7 +516,7 @@ class QueryWorkflow:
         pipeline_step(
             "retrieve",
             "answer",
-            inputs={"query": state["query"], "context_hits": len(hits[:12])},
+            inputs={"query": state["query"], "context_hits": len(hits)},
             result={
                 "trace_id": trace.id,
                 "answer_source": answer_source,
@@ -596,12 +692,26 @@ class QueryWorkflow:
         allowed_kbs: list[str],
         expand_kinds: list[str],
     ) -> list[dict[str, Any]]:
+        """命中后按 parent_anchor/parent_id 把同章图与公式带上，上限 8，不再卡死在每种 3 条。"""
         if not hits:
             return hits
         existing = {hit["id"] for hit in hits}
         extra: list[dict[str, Any]] = []
         parent_hits: list[dict[str, Any]] = []
         kind_counts: dict[str, int] = {}
+        sibling_added = 0
+        siblings = await self._sibling_units(hits, allowed_kbs)
+        for unit in siblings:
+            if unit.id in existing:
+                continue
+            kind = str((unit.unit_meta or {}).get("kind") or "")
+            if sibling_added >= SIBLING_EXPAND_CAP:
+                break
+            extra.append(_hit_from_unit(unit, 0.55, via="sibling"))
+            existing.add(unit.id)
+            sibling_added += 1
+            if kind in {"figure", "equation", "table"}:
+                kind_counts[kind] = kind_counts.get(kind, 0) + 1
         ids = list(existing)
         result = await self.session.execute(
             select(KnowledgeRelation).where(
@@ -635,11 +745,55 @@ class QueryWorkflow:
                 if kind not in {"figure", "equation", "table", "citation"}:
                     continue
             kind_counts[kind] = kind_counts.get(kind, 0) + 1
-            if kind in {"figure", "equation", "table", "citation"} and kind_counts[kind] > 3:
+            # 图/公式/表每种最多 8 条，避免再被 3 条配额丢掉同章框图
+            if kind in {"figure", "equation", "table", "citation"} and kind_counts[kind] > SIBLING_EXPAND_CAP:
                 continue
             extra.append(_hit_from_unit(unit, 0.4, via="relation"))
             existing.add(unit.id)
         return parent_hits + hits + extra
+
+    async def _sibling_units(
+        self,
+        hits: list[dict[str, Any]],
+        allowed_kbs: list[str],
+    ) -> list[KnowledgeUnit]:
+        """同文档 parent_anchor 或同一 parent_id 下的图/公式/表，供章节证据包捆绑。"""
+        doc_ids = {hit.get("document_id") for hit in hits if hit.get("document_id")}
+        parent_ids = {hit.get("parent_id") for hit in hits if hit.get("parent_id")}
+        anchors = {hit.get("parent_anchor") for hit in hits if hit.get("parent_anchor")}
+        if not doc_ids and not parent_ids:
+            return []
+        clauses = []
+        if doc_ids:
+            clauses.append(KnowledgeUnit.document_id.in_(list(doc_ids)))
+        if parent_ids:
+            clauses.append(KnowledgeUnit.parent_id.in_(list(parent_ids)))
+        stmt = select(KnowledgeUnit).where(
+            KnowledgeUnit.lifecycle.in_(list(RETRIEVAL_LIFECYCLES)),
+            or_(*clauses),
+        )
+        units = (await self.session.execute(stmt.limit(200))).scalars().all()
+        wanted_kinds = {"figure", "equation", "table"}
+        matched: list[KnowledgeUnit] = []
+        for unit in units:
+            if allowed_kbs and unit.kb_id not in allowed_kbs:
+                continue
+            meta = unit.unit_meta or {}
+            kind = str(meta.get("kind") or "")
+            same_parent = bool(unit.parent_id and unit.parent_id in parent_ids)
+            same_anchor = bool(anchors and meta.get("parent_anchor") in anchors and unit.document_id in doc_ids)
+            if not same_parent and not same_anchor:
+                continue
+            if kind in wanted_kinds or same_anchor:
+                matched.append(unit)
+        matched.sort(
+            key=lambda unit: (
+                0 if str((unit.unit_meta or {}).get("kind") or "") == "figure" else
+                1 if str((unit.unit_meta or {}).get("kind") or "") == "equation" else
+                2 if str((unit.unit_meta or {}).get("kind") or "") == "table" else 3
+            )
+        )
+        return matched
 
 
 def query_anchor_keys(query: str) -> list[str]:
@@ -663,11 +817,13 @@ def _hit_from_unit(unit: KnowledgeUnit, score: float, via: str = "") -> dict[str
         "source_section": unit.source_section,
         "document_id": unit.document_id,
         "parent_id": unit.parent_id,
+        "parent_anchor": meta.get("parent_anchor") or "",
         "score": score,
         "source_level": unit.source_level,
         "confidence": unit.confidence,
         "kind": meta.get("kind") or "",
         "anchor": meta.get("anchor") or "",
+        "latex": meta.get("latex") or "",
         "image_key": meta.get("image_key") or "",
         "image_url": meta.get("image_url") or "",
         "via": via,
@@ -679,11 +835,9 @@ def _published(unit: KnowledgeUnit) -> bool:
     return unit.lifecycle in RETRIEVAL_LIFECYCLES
 
 
-def _order_context_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    parents = [hit for hit in hits if hit.get("via") == "parent"]
-    related = [hit for hit in hits if hit.get("via") == "relation"]
-    core = [hit for hit in hits if hit.get("via") not in {"parent", "relation"}]
-    return parents + core + related
+def _order_context_hits(hits: list[dict[str, Any]], query: str = "", intent: str = "") -> list[dict[str, Any]]:
+    """兼容旧调用：统一走 kind 权重排序，不再按 via=parent/core/relation 把图压到后面。"""
+    return order_context_hits(hits, query, intent)
 
 
 def _answer_system() -> str:
@@ -733,46 +887,34 @@ def _extract_topics(query: str) -> list[str]:
 def _heuristic_answer(query: str, hits: list[dict[str, Any]], completeness: dict[str, Any]) -> str:
     if not hits:
         return "当前检索未命中可回答该问题的知识单元。请确认文档已抽取完成；高风险公式/规则仍需在「知识审核」发布后才会进入问答。"
-    grouped: dict[str, list[str]] = {}
-    for hit in hits:
-        grouped.setdefault(hit["semantic_role"], []).append(hit["content"][:400])
+    ordered = order_context_hits(hits, query)
     parts = [f"针对问题：{query}\n"]
-    order = [
-        SemanticRole.DEFINITION.value,
-        SemanticRole.ROOT_CAUSE.value,
-        SemanticRole.PRINCIPLE.value,
-        SemanticRole.SOLUTION.value,
-        SemanticRole.CONSTRAINT.value,
-        SemanticRole.EXAMPLE.value,
-        SemanticRole.EXCEPTION.value,
-        SemanticRole.FORMULA.value,
-        SemanticRole.METRIC.value,
-        SemanticRole.INTERFACE.value,
-        SemanticRole.REFERENCE.value,
-    ]
-    titles = {
-        SemanticRole.DEFINITION.value: "定义",
-        SemanticRole.ROOT_CAUSE.value: "问题原因",
-        SemanticRole.PRINCIPLE.value: "原理",
-        SemanticRole.SOLUTION.value: "解决方案",
-        SemanticRole.CONSTRAINT.value: "设计约束",
-        SemanticRole.EXAMPLE.value: "示例",
-        SemanticRole.EXCEPTION.value: "例外",
-        SemanticRole.FORMULA.value: "公式",
-        SemanticRole.METRIC.value: "指标",
-        SemanticRole.INTERFACE.value: "结构",
-        SemanticRole.REFERENCE.value: "参考文献",
-    }
-    for role in order:
-        if role in grouped:
-            parts.append(f"## {titles[role]}\n{grouped[role][0]}")
-    figures = [hit for hit in hits if hit.get("kind") == "figure"]
-    for fig in figures[:2]:
-        parts.append(f"相关图：{fig.get('title')} — {fig.get('content', '')[:180]} 地址：{fig.get('image_url') or fig.get('image_key') or ''}")
+    figures = [hit for hit in ordered if normalize_kind(hit) == "figure"]
+    equations = [hit for hit in ordered if normalize_kind(hit) == "equation"]
+    texts = [hit for hit in ordered if normalize_kind(hit) not in {"figure", "equation"}]
+    if figures:
+        parts.append("## 架构/电路图")
+        for fig in figures[:3]:
+            if fig.get("image_url") or fig.get("image_key"):
+                parts.append(f"[[figure:{fig['id']}]]")
+            parts.append(f"{fig.get('title')} — {(fig.get('content') or '')[:180]}")
+    elif completeness.get("missing") and "figure" in completeness.get("missing"):
+        parts.append("资料未覆盖架构图。")
+    if equations:
+        parts.append("## 公式")
+        for eq in equations[:4]:
+            latex = eq.get("latex") or ""
+            body = f"$$\n{latex}\n$$" if latex else (eq.get("content") or "")[:400]
+            parts.append(f"{eq.get('title')}\n{body}")
+    else:
+        parts.append("本节无公式。")
+    if texts:
+        parts.append("## 说明")
+        parts.append((texts[0].get("content") or "")[:400])
     missing = completeness.get("missing") or []
     if missing:
         parts.append("\n当前覆盖不完整，缺失：" + ", ".join(missing))
-    parts.append("\n知识来源：\n" + "\n".join(f"- {h['title']} ({h.get('source_chapter') or 'N/A'}) p.{h.get('source_page')}" for h in hits[:5]))
+    parts.append("\n知识来源：\n" + "\n".join(f"- {h['title']} ({h.get('source_chapter') or 'N/A'}) p.{h.get('source_page')}" for h in ordered[:5]))
     return "\n\n".join(parts)
 
 

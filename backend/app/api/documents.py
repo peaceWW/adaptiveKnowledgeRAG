@@ -6,9 +6,10 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import ConfirmStrategy
-from app.api.pdf_source import pdf_manifest, render_pdf_page
+from app.api.pdf_source import page_text_layer, pdf_manifest, render_pdf_page
 from app.api.units import apply_unit_review, _serialize as serialize_unit
 from app.domain.extraction_policy import EXTRACTION_KINDS, extraction_kind, normalized_policy
+from app.ingestion.catalog_sync import remove_catalog_for_document
 from app.ingestion.configured_extraction import strategy_snapshot
 from app.deps import get_stores
 from app.domain.enums import DocumentStatus
@@ -122,6 +123,14 @@ async def get_pdf_source(doc_id: str, session: AsyncSession = Depends(get_sessio
     doc, raw = await _stored_pdf(doc_id, session)
     manifest = await run_in_threadpool(pdf_manifest, raw)
     return {"document_id": doc.id, "filename": doc.filename, **manifest}
+
+
+@router.get("/{doc_id}/pages/{page_number}/text")
+async def get_pdf_page_text(doc_id: str, page_number: int,
+                            session: AsyncSession = Depends(get_session)):
+    """原稿选中复制：返回与页面图像对齐的文字层，扫描件可能为空。"""
+    _, raw = await _stored_pdf(doc_id, session)
+    return await run_in_threadpool(page_text_layer, raw, page_number)
 
 
 @router.get("/{doc_id}/pages/{page_number}")
@@ -304,6 +313,8 @@ async def delete_document(doc_id: str, session: AsyncSession = Depends(get_sessi
     leftover_tasks = await session.execute(select(ReviewTask).where(ReviewTask.document_id == doc.id))
     for task in leftover_tasks.scalars().all():
         await session.delete(task)
+    # 单元已删，再摘该文档自动生成的文章/章节/知识点目录，避免知识目录残留幽灵树
+    await remove_catalog_for_document(session, doc.kb_id, doc.id)
     if doc.object_key:
         stores.minio.delete(doc.object_key)
     stores.minio.delete_prefix(f"images/{doc.id}")

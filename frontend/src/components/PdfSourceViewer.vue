@@ -11,13 +11,15 @@
       <div class="view-controls">
         <a-select v-model:value="zoom" :options="zoomOptions" aria-label="PDF 缩放" class="zoom-select" />
         <a-button v-if="mode !== 'document'" :disabled="!manifest || !validSourcePage" @click="locateSource">定位知识点</a-button>
+        <a-button :disabled="!imageUrl" @mousedown.prevent="copySelection">复制选中</a-button>
+        <a-button :disabled="!canCopyPage" @click="copyPage">复制本页</a-button>
         <a-button @click="expanded = !expanded">{{ expanded ? '退出大图' : '大图阅读' }}</a-button>
         <a-button :loading="downloading" :disabled="!manifest" @click="download">下载原 PDF</a-button>
       </div>
     </div>
     <div class="source-location">
       <span>{{ locationLabel }}</span>
-      <span>原始 PDF 页面 · 保留排版、图片与公式</span>
+      <span>{{ textHint }}</span>
     </div>
     <div ref="viewport" class="pdf-viewport" :aria-busy="loading">
       <div v-if="error" class="viewer-state">
@@ -30,6 +32,15 @@
       <div v-else-if="loading" class="viewer-state"><a-spin size="large" /><p>正在加载 PDF 原始页面…</p></div>
       <div v-else-if="imageUrl" class="paper" :style="{ width: `${zoom}%`, maxWidth: expanded ? `${1600 * zoom / 100}px` : undefined }">
         <img :src="imageUrl" :alt="`${filename}，原 PDF 第 ${page} 页`" draggable="false" @error="error = '页面图像加载失败，请重试'" />
+        <!-- 透明文字层与页面图像对齐，供拖选 / Ctrl+C / 复制按钮 -->
+        <div class="text-layer" aria-label="原稿文字，可选择复制">
+          <span
+            v-for="(span, index) in textSpans"
+            :key="index"
+            class="pdf-text"
+            :style="spanStyle(span)"
+          >{{ span.text }}</span>
+        </div>
       </div>
     </div>
     <div class="pdf-footer">{{ filename }}<span v-if="manifest"> · {{ manifest.page_count }} 页</span></div>
@@ -39,7 +50,10 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import axios from 'axios';
+import { message } from 'ant-design-vue';
 import { api } from '../api';
+
+type TextSpan = { text: string; x: number; y: number; w: number; h: number };
 
 const props = withDefaults(defineProps<{ documentId: string; filename: string; sourcePage?: number; sourceKey: string; mode?: 'evidence' | 'document' }>(), { mode: 'evidence' });
 defineEmits<{ showText: [] }>();
@@ -52,12 +66,21 @@ const loading = ref(true);
 const downloading = ref(false);
 const error = ref('');
 const imageUrl = ref('');
+const textSpans = ref<TextSpan[]>([]);
 const viewport = ref<HTMLElement>();
 const validSourcePage = computed(() => Number.isInteger(props.sourcePage) && Number(props.sourcePage) >= 1 && Number(props.sourcePage) <= (manifest.value?.page_count || 0));
+const pagePlainText = computed(() => textSpans.value.map(span => span.text).join('\n'));
+const canCopyPage = computed(() => Boolean(pagePlainText.value.trim()));
 const locationLabel = computed(() => {
   if (props.mode === 'document') return manifest.value ? `文档原文 · 共 ${manifest.value.page_count} 页` : '文档原文';
   return validSourcePage.value ? `知识点来源：第 ${props.sourcePage} 页` : '此知识点未记录有效来源页，请手动翻页核对';
 });
+const textHint = computed(() => {
+  if (loading.value || error.value || !imageUrl.value) return '原始 PDF 页面 · 保留排版、图片与公式';
+  if (!canCopyPage.value) return '本页无可选文字（可能是扫描件或纯图）';
+  return '可在页面上拖选文字，Ctrl+C 或点「复制选中」';
+});
+const lastSelection = ref('');
 const cache = new Map<string, string>();
 let controller: AbortController | undefined;
 let version = 0;
@@ -71,6 +94,58 @@ function setPage(value: number | string | null) {
 function locateSource() {
   if (validSourcePage.value) setPage(props.sourcePage!);
   viewport.value?.scrollTo({ top: 0, left: 0 });
+}
+function spanStyle(span: TextSpan) {
+  // 百分比对齐渲染图；字号只影响选区高亮，命中区域由包围盒决定
+  return {
+    left: `${span.x * 100}%`,
+    top: `${span.y * 100}%`,
+    width: `${span.w * 100}%`,
+    height: `${span.h * 100}%`,
+  };
+}
+function selectedInViewer() {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed) return '';
+  const root = viewport.value;
+  const anchor = selection.anchorNode;
+  if (root && anchor && !root.contains(anchor)) return '';
+  return selection.toString();
+}
+async function writeClipboard(text: string, ok: string) {
+  const value = text.replace(/\u00a0/g, ' ').trim();
+  if (!value) {
+    message.warning('没有可复制的文字。扫描件或图片页通常不含可选文本。');
+    return;
+  }
+  try {
+    if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable');
+    await navigator.clipboard.writeText(text);
+    message.success(ok);
+  } catch {
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.left = '-9999px';
+    document.body.appendChild(area);
+    area.select();
+    const copied = document.execCommand('copy');
+    area.remove();
+    if (copied) message.success(ok);
+    else message.error('复制失败，请检查浏览器剪贴板权限');
+  }
+}
+function rememberSelection() {
+  const text = selectedInViewer();
+  if (text) lastSelection.value = text;
+}
+function copySelection() {
+  rememberSelection();
+  return writeClipboard(selectedInViewer() || lastSelection.value, '已复制选中内容');
+}
+function copyPage() {
+  return writeClipboard(pagePlainText.value, '已复制本页文字');
 }
 async function errorText(err: unknown) {
   if (axios.isAxiosError(err)) {
@@ -90,13 +165,23 @@ async function loadPage() {
   loading.value = true;
   error.value = '';
   imageUrl.value = '';
+  textSpans.value = [];
   const width = expanded.value || zoom.value > 100 ? 3000 : 2000;
   const key = `${page.value}:${width}`;
+  const signal = controller.signal;
+  api.get(`/documents/${props.documentId}/pages/${page.value}/text`, { signal })
+    .then(({ data }) => {
+      if (request !== version || disposed) return;
+      textSpans.value = Array.isArray(data?.spans) ? data.spans.filter((item: TextSpan) => item?.text) : [];
+    })
+    .catch((err) => {
+      if (!axios.isCancel(err) && request === version && !disposed) textSpans.value = [];
+    });
   try {
     let url = cache.get(key);
     if (!url) {
       const { data } = await api.get(`/documents/${props.documentId}/pages/${page.value}`, {
-        params: { width }, responseType: 'blob', signal: controller.signal,
+        params: { width }, responseType: 'blob', signal,
       });
       if (request !== version || disposed) return;
       url = URL.createObjectURL(data);
@@ -158,13 +243,18 @@ watch(() => props.sourceKey, () => {
   if (manifest.value) setPage(validSourcePage.value ? props.sourcePage! : 1);
   viewport.value?.scrollTo({ top: 0, left: 0 });
 });
-onMounted(() => { initialize(); document.addEventListener('keydown', onKey); });
+onMounted(() => {
+  initialize();
+  document.addEventListener('keydown', onKey);
+  document.addEventListener('selectionchange', rememberSelection);
+});
 onBeforeUnmount(() => {
   disposed = true;
   version++;
   controller?.abort();
   cache.forEach(url => URL.revokeObjectURL(url));
   document.removeEventListener('keydown', onKey);
+  document.removeEventListener('selectionchange', rememberSelection);
 });
 </script>
 
@@ -176,8 +266,20 @@ onBeforeUnmount(() => {
 .zoom-select { width: 116px; }
 .source-location { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; padding: 8px 12px; color: #64748b; font-size: 12px; }
 .pdf-viewport { flex: 1; min-height: 0; overflow: auto; padding: 20px; background: #e7ecf2; }
-.paper { margin: 0 auto; background: white; box-shadow: 0 3px 14px #0f172a24; line-height: 0; }
-.paper img { display: block; width: 100%; height: auto; max-width: none; }
+.paper { position: relative; margin: 0 auto; background: white; box-shadow: 0 3px 14px #0f172a24; line-height: 0; }
+.paper img { display: block; width: 100%; height: auto; max-width: none; pointer-events: none; user-select: none; }
+.text-layer { position: absolute; inset: 0; overflow: hidden; line-height: 1; }
+.pdf-text {
+  position: absolute;
+  color: transparent;
+  white-space: pre;
+  overflow: hidden;
+  cursor: text;
+  line-height: 1;
+  transform-origin: 0 0;
+  user-select: text;
+}
+.pdf-text::selection { background: rgba(37, 99, 235, 0.32); color: transparent; }
 .viewer-state { padding: 48px 12px; text-align: center; color: #64748b; }
 .viewer-state .ant-space { margin-top: 16px; }
 .pdf-footer { padding: 8px 12px; font-size: 12px; color: #64748b; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }

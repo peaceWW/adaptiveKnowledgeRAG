@@ -5,7 +5,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.documents import document_original_text
 from app.api.schemas import CatalogNodeCreate, KnowledgeBaseCreate
-from app.ingestion.catalog_sync import catalog_needs_rebuild, public_related, sync_catalog_for_kb, unit_id_from_related
+from app.ingestion.catalog_sync import catalog_needs_rebuild, prune_orphan_auto_catalogs, public_related, sync_catalog_for_kb, unit_id_from_related
 from app.storage.db import get_session
 from app.storage.models import Document, KnowledgeBase, KnowledgeCatalog, KnowledgeUnit
 from app.storage.paths import attach_image_refs
@@ -143,6 +143,8 @@ def _quote_from_unit(unit: KnowledgeUnit, documents_map: dict[str, Document]) ->
         "quote": quote,
         "original": _snippet_window(original, quote) if original else quote,
         "content": unit.content,
+        "kind": meta.get("kind") or "",
+        "latex": meta.get("latex") or "",
         "image_key": meta.get("image_key") or "",
         "image_url": meta.get("image_url") or "",
     }
@@ -154,6 +156,12 @@ async def catalog(kb_id: str, session: AsyncSession = Depends(get_session)):
         select(KnowledgeCatalog).where(KnowledgeCatalog.kb_id == kb_id).order_by(KnowledgeCatalog.level, KnowledgeCatalog.path)
     )
     nodes = result.scalars().all()
+    if await prune_orphan_auto_catalogs(session, kb_id):
+        await session.commit()
+        result = await session.execute(
+            select(KnowledgeCatalog).where(KnowledgeCatalog.kb_id == kb_id).order_by(KnowledgeCatalog.level, KnowledgeCatalog.path)
+        )
+        nodes = result.scalars().all()
     unit_count = int(await session.scalar(select(func.count(KnowledgeUnit.id)).where(KnowledgeUnit.kb_id == kb_id)) or 0)
     if catalog_needs_rebuild(nodes, unit_count):
         await sync_catalog_for_kb(session, kb_id)

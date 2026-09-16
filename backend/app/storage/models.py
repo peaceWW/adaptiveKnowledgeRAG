@@ -212,6 +212,7 @@ class GoldenCase(Base):
     forbidden_knowledge: Mapped[list[Any]] = mapped_column(JSON, default=list)
     expected_roles: Mapped[list[Any]] = mapped_column(JSON, default=list)
     kb_id: Mapped[str | None] = mapped_column(String(36))
+    evaluation_config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 class EvaluationRun(Base):
@@ -220,6 +221,10 @@ class EvaluationRun(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     dataset_name: Mapped[str] = mapped_column(String(200), default="default")
     strategy_name: Mapped[str] = mapped_column(String(200), default="")
+    status: Mapped[str] = mapped_column(String(32), default="completed")
+    owner_id: Mapped[str | None] = mapped_column(String(36))
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     metrics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     details: Mapped[list[Any]] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

@@ -33,7 +33,7 @@
             <div v-else-if="selected.children.length" class="child-section"><div class="section-title"><b>下级分类</b></div><button v-for="id in selected.children" :key="id" @click="selectNode(id)">{{ byId.get(id)?.name }}<small>{{ byId.get(id)?.unit_count }} →</small></button></div>
             <div class="section-title evidence-title"><b>知识依据</b><small>{{ selectedEvidence.length }} 条</small></div>
             <a-segmented v-model:value="evidenceFilter" :options="[{ label: '全部', value: 'all' }, { label: '指标', value: 'metrics' }, { label: '约束', value: 'constraints' }, { label: '对比', value: 'comparisons' }]" block />
-            <div v-for="item in pagedEvidence" :key="item.id" class="evidence-card"><div><a-tag :color="item.lifecycle === 'AI_PROCESSED' ? 'orange' : 'blue'">{{ roleLabel(item.role) }}</a-tag><small v-if="item.lifecycle === 'AI_PROCESSED'">AI 抽取 · 待核对</small></div><button class="evidence-title-button" @click="openEvidence(item)">{{ item.title }}</button><p>{{ item.content.slice(0, 180) }}{{ item.content.length > 180 ? '…' : '' }}</p><div class="evidence-source">{{ item.document_title }}<span v-if="item.page"> · p.{{ item.page }}</span></div><button class="source-link" @click="openEvidence(item)">查看依据{{ isPdf(item) ? '与原 PDF' : '' }} ↗</button></div>
+            <div v-for="item in pagedEvidence" :key="item.id" class="evidence-card"><div><a-tag :color="item.lifecycle === 'AI_PROCESSED' ? 'orange' : 'blue'">{{ roleLabel(item.role) }}</a-tag><a-tag v-if="item.kind === 'figure' || item.image_key" color="purple">图</a-tag><a-tag v-else-if="item.kind === 'equation' || item.role === 'formula'" color="cyan">公式</a-tag><small v-if="item.lifecycle === 'AI_PROCESSED'">AI 抽取 · 待核对</small></div><button class="evidence-title-button" @click="openEvidence(item)">{{ item.title }}</button><p>{{ item.content.slice(0, 180) }}{{ item.content.length > 180 ? '…' : '' }}</p><div class="evidence-source">{{ item.document_title }}<span v-if="item.page"> · p.{{ item.page }}</span></div><button class="source-link" @click="openEvidence(item)">查看依据{{ isPdf(item) ? '与原 PDF' : '' }} ↗</button></div>
             <a-empty v-if="!filteredEvidence.length" description="暂无此类依据，不能据此推断指标或替换条件" />
             <a-pagination v-if="filteredEvidence.length > 6" v-model:current="evidencePage" simple :total="filteredEvidence.length" :page-size="6" class="evidence-pagination" />
           </template>
@@ -59,8 +59,9 @@ import PdfSourceViewer from '../components/PdfSourceViewer.vue';
 import DocumentAsset from '../components/DocumentAsset.vue';
 import { renderAnswer } from '../answer';
 import { useSession } from '../stores/session';
+import { sortEvidence } from '../evidenceOrder';
 interface DesignNode { id: string; name: string; kind: string; parent_id?: string; children: string[]; aliases: string[]; evidence_ids: string[]; path: string[]; unit_count: number; document_count: number; technology_ids: string[] }
-interface Evidence { id: string; title: string; content: string; original: string; role: string; lifecycle: string; document_id?: string; document_title: string; filename: string; page?: number; chapter: string; section: string; image_key?: string; image_url?: string }
+interface Evidence { id: string; title: string; content: string; original: string; role: string; lifecycle: string; document_id?: string; document_title: string; filename: string; page?: number; chapter: string; section: string; image_key?: string; image_url?: string; kind?: string; latex?: string }
 const nodes = ref<DesignNode[]>([]), evidence = ref<Record<string, Evidence>>({}), summary = ref<Record<string, number>>({}), kbs = ref<{id: string; name: string}[]>([]);
 const kbId = ref(''), keyword = ref(''), selectedId = ref('chip'), focusId = ref('chip'), expandedKeys = ref<string[]>(['chip', 'architecture', 'modules']);
 const collapsed = reactive<Record<string, boolean>>({}), loading = ref(false), error = ref(''), compareIds = ref<string[]>([]), showCompare = ref(false), showSource = ref(false), source = ref<Evidence>(), textOnly = ref(false), detailPanel = ref<HTMLElement>();
@@ -88,7 +89,7 @@ const mapRoot = computed(() => {
 const moduleNode = computed(() => { const n = selected.value; return n?.kind === 'module' ? n : n?.kind === 'technology' ? byId.value.get(n.parent_id!) : undefined; });
 const candidateTechs = computed(() => (moduleNode.value?.technology_ids || []).map(id => byId.value.get(id)!).filter(Boolean));
 const comparedTechs = computed(() => compareIds.value.map(id => byId.value.get(id)!).filter(Boolean));
-const selectedEvidence = computed(() => (selected.value?.evidence_ids || []).map(id => evidence.value[id]).filter(Boolean));
+const selectedEvidence = computed(() => sortEvidence((selected.value?.evidence_ids || []).map(id => evidence.value[id]).filter((item): item is Evidence => Boolean(item))));
 const filteredEvidence = computed(() => selectedEvidence.value.filter(e => evidenceFilter.value === 'all' || roles[evidenceFilter.value]?.includes(e.role)));
 const pagedEvidence = computed(() => filteredEvidence.value.slice((evidencePage.value - 1) * 6, evidencePage.value * 6));
 function techEvidence(tech: DesignNode, facet: string) { return tech.evidence_ids.map(id => evidence.value[id]).filter(e => e && roles[facet]?.includes(e.role)); }

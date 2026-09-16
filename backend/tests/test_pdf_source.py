@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from app.api import documents
-from app.api.pdf_source import pdf_manifest, render_pdf_page
+from app.api.pdf_source import page_text_layer, pdf_manifest, render_pdf_page
 from app.storage.db import get_session
 
 
@@ -100,7 +100,11 @@ def test_pdf_routes(monkeypatch):
         assert response.status_code == 200
         assert response.headers['content-type'] == 'image/png'
         assert response.content.startswith(b'\x89PNG')
+        layer = client.get('/api/documents/doc-1/pages/1/text').json()
+        assert layer['page'] == 1
+        assert any('Hybrid ADC' in span['text'] for span in layer['spans'])
         assert client.get('/api/documents/doc-1/pages/0').status_code == 404
+        assert client.get('/api/documents/doc-1/pages/0/text').status_code == 404
         assert client.get('/api/documents/doc-1/pages/1?width=99999').status_code == 422
         download = client.get('/api/documents/doc-1/original')
         assert download.content == raw
@@ -110,6 +114,41 @@ def test_pdf_routes(monkeypatch):
         assert client.get('/api/documents/doc-1/source').status_code == 404
         doc.filename = 'notes.md'
         assert client.get('/api/documents/doc-1/source').status_code == 415
+
+
+def test_page_text_layer_is_selectable_and_aligned():
+    raw = sample_pdf()
+    layer = page_text_layer(raw, 1)
+    joined = '\n'.join(span['text'] for span in layer['spans'])
+    assert 'A Hybrid ADC-Based Receiver' in joined
+    assert 'SNR = 6.02N + 1.76' in joined
+    assert all(0 <= span[key] <= 1 for span in layer['spans'] for key in ('x', 'y', 'w', 'h'))
+    assert all(span['w'] > 0 and span['h'] > 0 for span in layer['spans'])
+    title = next(span for span in layer['spans'] if 'Hybrid ADC' in span['text'])
+    # 标题在页眉下方、左栏区域内，避免叠层偏离渲染图
+    assert title['y'] < 0.2
+    assert title['x'] < 0.3
+
+
+def test_rotated_page_text_layer_uses_visible_rect():
+    with fitz.open(stream=sample_pdf(), filetype='pdf') as pdf:
+        pdf[0].set_rotation(90)
+        raw = pdf.tobytes()
+    layer = page_text_layer(raw, 1)
+    assert layer['width'] == 792
+    assert layer['height'] == 612
+    assert any('Hybrid ADC' in span['text'] for span in layer['spans'])
+    assert all(0 <= span[key] <= 1 for span in layer['spans'] for key in ('x', 'y', 'w', 'h'))
+
+
+def test_image_only_page_has_empty_text_layer():
+    with fitz.open() as pdf:
+        page = pdf.new_page(width=200, height=200)
+        tile = fitz.Pixmap(fitz.csRGB, (0, 0, 80, 40), False)
+        tile.clear_with(180)
+        page.insert_image(fitz.Rect(20, 20, 180, 180), pixmap=tile)
+        raw = pdf.tobytes()
+    assert page_text_layer(raw, 1)['spans'] == []
 
 
 def test_corrupt_page_stream_is_reported():

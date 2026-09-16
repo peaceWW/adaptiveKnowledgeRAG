@@ -13,6 +13,7 @@ from app.domain.strategy import (
 from app.ingestion.extractor import extract_units_from_text
 from app.ingestion.paper_extractor import extract_paper_units
 from app.observability.pipeline_log import step as pipeline_step
+from app.retrieval.evidence_order import infer_evidence_types, is_architecture_query
 
 
 class TechnicalKnowledgeStrategy:
@@ -81,18 +82,28 @@ class TechnicalKnowledgeStrategy:
     def plan(self, query: QueryContext) -> RetrievalPlan:
         roles = INTENT_ROLE_MAP.get(query.intent, [SemanticRole.DEFINITION, SemanticRole.EXPLANATION])
         graph = query.intent in {QueryIntent.SOLUTION, QueryIntent.CAUSE, QueryIntent.RISK, QueryIntent.COMPARISON}
+        required_kinds = list(query.evidence_types or infer_evidence_types(query.query, query.intent.value))
+        # 架构问 definition/principle 不够时，完整度按 required kinds 要图，而不是只查定义角色
+        if is_architecture_query(query.query) and "figure" not in required_kinds:
+            required_kinds = ["figure", "equation", "text"]
+        expand_kinds = [kind for kind in required_kinds if kind in {"figure", "equation", "table"}] or [
+            "figure",
+            "equation",
+            "table",
+        ]
         return RetrievalPlan(
             intent=query.intent,
             topics=query.topics,
             required_roles=roles,
-            graph_expand=graph,
+            graph_expand=graph or "figure" in required_kinds or "equation" in required_kinds,
             search_strategy="HYBRID",
             completeness_check=True,
+            required_kinds=required_kinds,
             steps=[
                 {"type": "catalog_filter", "domain": query.domain},
                 {"type": "concept_search", "concepts": query.topics},
-                {"type": "hybrid_search", "roles": [r.value for r in roles], "expand_kinds": ["figure", "equation", "table"]},
-                {"type": "completeness_check"},
+                {"type": "hybrid_search", "roles": [r.value for r in roles], "expand_kinds": expand_kinds},
+                {"type": "completeness_check", "required_kinds": required_kinds},
             ],
         )
 

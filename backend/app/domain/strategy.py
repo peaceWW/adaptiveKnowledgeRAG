@@ -48,6 +48,7 @@ class QueryContext:
     user_role: str = "end_user"
     department: str = ""
     project: str = ""
+    evidence_types: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -59,6 +60,7 @@ class RetrievalPlan:
     search_strategy: str
     completeness_check: bool
     steps: list[dict[str, Any]] = field(default_factory=list)
+    required_kinds: list[str] = field(default_factory=list)
 
 
 @dataclass

@@ -131,8 +131,13 @@ def build_design_map(units, documents):
             'filename': doc.filename if doc else '', 'page': unit.source_page,
             'chapter': unit.source_chapter, 'section': unit.source_section,
             'image_key': meta.get('image_key', ''), 'image_url': meta.get('image_url', ''),
+            'kind': meta.get('kind') or '', 'latex': meta.get('latex') or '',
         }
-        focal = ' '.join([unit.title or '', *[str(c) for c in unit.concepts or []]])
+        focal = ' '.join([
+            unit.title or '',
+            *[str(c) for c in unit.concepts or []],
+            str(meta.get('engineering_topic') or ''),
+        ])
         full = focal + '\n' + (unit.content or '')
         assigned = False
         for module_key, name, aliases, technologies in MODULES:
@@ -163,7 +168,11 @@ def build_design_map(units, documents):
         for facet, _, roles in FACETS:
             if unit.semantic_role in roles:
                 # Deduplicate concepts across documents; raw unit references stay in the evidence panel.
-                concepts = [str(c).strip() for c in unit.concepts or [] if str(c).strip()]
+                concepts = [
+                    str(c).strip()
+                    for c in unit.concepts or []
+                    if str(c).strip() and not re.match(r'(?i)^(fig\.|eq\.)', str(c).strip())
+                ]
                 topic = concepts[0] if facet == 'concepts' and concepts else unit.title
                 nid = add(facet + ':' + _key(_normal(topic)), topic, 'topic', facet)
                 memberships[nid].add(unit.id)

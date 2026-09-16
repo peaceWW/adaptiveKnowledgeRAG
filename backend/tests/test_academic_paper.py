@@ -300,6 +300,47 @@ def test_vision_figure_degrades_without_model():
     fig = next(draft for draft in drafts if (draft.unit_meta or {}).get("kind") == "figure")
     assert "Fig. 1" in fig.title
     assert "Description:" not in fig.content
+    assert (fig.unit_meta or {}).get("engineering_topic") == "hybrid_adc_receiver"
+    assert "Topic: hybrid_adc_receiver" in fig.content
+    assert "Fig.1" in fig.concepts
+
+
+def test_figure_equation_cross_links_and_section_concepts():
+    parsed = parse_bytes("paper.md", IEEE_TEXT.encode("utf-8"))
+    drafts = extract_paper_units(
+        DocumentContext(document_id="d1", filename="paper.md", text=parsed["text"], structure=parsed)
+    )
+    by_anchor = {str((draft.unit_meta or {}).get("anchor")): draft for draft in drafts}
+    fig, eq = by_anchor["fig:1"], by_anchor["eq:1"]
+    assert any(rel.get("type") == "HAS_EQUATION" and rel.get("to_key") == "eq:1" for rel in fig.relations)
+    assert any(rel.get("type") == "HAS_FIGURE" and rel.get("to_key") == "fig:1" for rel in eq.relations)
+    assert "Fig.1" in (by_anchor["sec:II"].concepts or [])
+    assert any(str(item).startswith("Eq.") for item in (by_anchor["sec:I"].concepts or []))
+
+
+def test_unit_payload_prefixes_figure_and_equation():
+    from types import SimpleNamespace as NS
+    from app.domain.payload import unit_embed_text, unit_vector_payload
+
+    fig = NS(
+        kb_id="k", knowledge_type="technical_concept", semantic_role="interface", domain="semiconductor",
+        concepts=["Fig.1"], source_level="REVIEWED", lifecycle="AI_PROCESSED", version=1,
+        title="Fig. 1", content="Fig. 1. Hybrid ADC-based receiver\nTopic: hybrid_adc_receiver",
+        document_id="d", parent_id="", source_page=2, source_chapter="II", source_section="fig:1",
+        unit_meta={"kind": "figure", "engineering_topic": "hybrid_adc_receiver"},
+    )
+    eq = NS(
+        kb_id="k", knowledge_type="technical_concept", semantic_role="formula", domain="semiconductor",
+        concepts=["Eq.(1)"], source_level="REVIEWED", lifecycle="AI_PROCESSED", version=1,
+        title="Equation (1)", content="Equation (1)\n$$x=1$$",
+        document_id="d", parent_id="", source_page=1, source_chapter="I", source_section="eq:1",
+        unit_meta={"kind": "equation", "eq_id": "1"},
+    )
+    assert unit_embed_text(fig).startswith("图:")
+    assert unit_embed_text(eq).startswith("公式:")
+    assert unit_vector_payload(fig)["content"].startswith("图:")
+    assert unit_vector_payload(fig)["engineering_topic"] == "hybrid_adc_receiver"
+    assert unit_vector_payload(eq)["content"].startswith("公式:")
 
 
 def test_pipeline_log_clips_long_text():

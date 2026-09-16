@@ -1,6 +1,6 @@
 prompt_id: completeness-checker
 title: 回答覆盖检查
-version: V3
+version: V5
 strategy: retrieval
 model: default
 temperature: 0.0
@@ -12,6 +12,10 @@ content: |
   - 指标/对比：是否有 metric 或 comparison，且条件（速率、信道、工艺）齐全
   - 约束/风险：是否有 constraint/exception/limitation
   - 问到 Fig/Eq：是否命中对应图或公式单元
+  - required_kinds 含 figure 的架构/框图/电路/receiver/hybrid/接收机：retrieved_kinds 必须含 figure。缺图则 missing 写入 figure，secondary_query 加 Fig 与章节名。不要只因为没有 definition 角色就判失败。
+  - required_kinds 含 equation 的抽头/系数问题：缺公式则 missing 写入 equation
+  - 纯文字资料（markdown/CDC 时序说明等）没有图是正常的：不要因为缺 figure 判不完整，除非问题明确在问架构/框图
+
   缺哪块写入 missing，并给出可执行的 secondary_query（模块名+指标+Fig/Eq）。
 
   必须输出 JSON：
@@ -21,6 +25,8 @@ input_schema:
   required: list
   retrieved_titles: list
   retrieved_roles: list
+  retrieved_kinds: list
+  required_kinds: list
 output_schema:
   required_knowledge: list
   covered: list

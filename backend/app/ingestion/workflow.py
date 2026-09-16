@@ -5,10 +5,11 @@ from __future__ import annotations
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.enums import DocumentStatus, KnowledgeType, RelationType
-from app.domain.payload import unit_vector_payload
+from app.domain.payload import unit_embed_text, unit_vector_payload
 from app.domain.registry import registry
 from app.domain.strategy import DocumentContext
 from app.ingestion.assets import materialize_paper_assets
@@ -279,6 +280,7 @@ class IngestionWorkflow:
         classification = dict(classification)
         classification["coverage"] = coverage
         doc.classification = classification
+        await self._purge_document_knowledge(doc.id)
         unit_ids: list[str] = []
         doc.status = DocumentStatus.EXTRACTING.value
         doc.parse_progress = 85
@@ -417,7 +419,7 @@ class IngestionWorkflow:
             if not unit:
                 continue
             units.append(unit)
-            texts.append(f"{unit.title}\n{unit.content}")
+            texts.append(unit_embed_text(unit))
         if texts:
             vectors = self.gateway.embed(texts)
             for unit, vector in zip(units, vectors, strict=False):
@@ -527,6 +529,35 @@ class IngestionWorkflow:
                 "confirmed_strategy": strategy_type,
             }
         )
+
+
+    async def _purge_document_knowledge(self, document_id: str) -> None:
+        """重抽前清掉该文档旧单元、关系、审核任务和向量点，避免图/公式重复入库。"""
+        units = (
+            await self.session.execute(select(KnowledgeUnit).where(KnowledgeUnit.document_id == document_id))
+        ).scalars().all()
+        unit_ids = [unit.id for unit in units]
+        if not unit_ids:
+            return
+        tasks = await self.session.execute(select(ReviewTask).where(ReviewTask.ku_id.in_(unit_ids)))
+        for task in tasks.scalars().all():
+            await self.session.delete(task)
+        leftover = await self.session.execute(select(ReviewTask).where(ReviewTask.document_id == document_id))
+        for task in leftover.scalars().all():
+            await self.session.delete(task)
+        rels = await self.session.execute(
+            select(KnowledgeRelation).where(
+                or_(KnowledgeRelation.from_id.in_(unit_ids), KnowledgeRelation.to_id.in_(unit_ids))
+            )
+        )
+        for rel in rels.scalars().all():
+            await self.session.delete(rel)
+        for unit in units:
+            self.qdrant.delete(unit.id)
+            if self.es_store:
+                await self.es_store.delete(unit.id)
+            await self.session.delete(unit)
+        await self.session.flush()
 
 
 def _sub_domain(structure: dict) -> str:

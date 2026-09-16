@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.schemas import BatchReviewAction, ReviewAction
 from app.deps import get_stores
 from app.domain.enums import KnowledgeLifecycle
-from app.domain.payload import unit_vector_payload
+from app.domain.payload import unit_embed_text, unit_vector_payload
 from app.storage.db import get_session
 from app.storage.models import Document, KnowledgeUnit, ReviewTask
 from app.storage.paths import attach_image_refs
@@ -61,7 +61,7 @@ def apply_unit_review(
     else:
         raise HTTPException(400, "unknown action")
     if unit.lifecycle == KnowledgeLifecycle.PUBLISHED.value:
-        vector = stores.gateway.embed([f"{unit.title}\n{unit.content}"])[0]
+        vector = stores.gateway.embed([unit_embed_text(unit)])[0]
         stores.qdrant.upsert(unit.id, vector, unit_vector_payload(unit))
 
 

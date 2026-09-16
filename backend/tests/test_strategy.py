@@ -9,7 +9,12 @@ def test_registry_has_phase1_strategies():
     assert registry.get(KnowledgeType.API_DOCUMENT).type() == KnowledgeType.API_DOCUMENT
 
 
-def test_solution_plan_requires_constraint():
+def test_architecture_plan_requires_figure_kind():
+    plan = registry.get(KnowledgeType.TECHNICAL_CONCEPT).plan(
+        QueryContext(query="混合接收机", intent=QueryIntent.DEFINITION, topics=["receiver"])
+    )
+    assert "figure" in plan.required_kinds
+    assert plan.graph_expand is True
     plan = registry.get(KnowledgeType.TECHNICAL_CONCEPT).plan(
         QueryContext(query="如何解决 CDC", intent=QueryIntent.SOLUTION, topics=["CDC"])
     )

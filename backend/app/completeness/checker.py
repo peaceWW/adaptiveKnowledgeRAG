@@ -20,7 +20,9 @@ class CompletenessChecker:
         retrieved_titles: list[str],
         retrieved_roles: list[str],
         threshold: float = 0.8,
+        retrieved_kinds: list[str] | None = None,
     ) -> CompletenessResult:
+        """覆盖检查：把已命中 kind 交给模型，架构问才能判断缺不缺图。"""
         llm = self.gateway.chat_json(
             load_prompt("completeness-checker", DEFAULT_PROMPT),
             str(
@@ -29,6 +31,8 @@ class CompletenessChecker:
                     "required": required,
                     "retrieved_titles": retrieved_titles,
                     "retrieved_roles": retrieved_roles,
+                    "retrieved_kinds": retrieved_kinds or [],
+                    "required_kinds": list(query.evidence_types or []),
                 }
             ),
         )

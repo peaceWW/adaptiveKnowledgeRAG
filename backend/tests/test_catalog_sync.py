@@ -1,6 +1,12 @@
 from types import SimpleNamespace
 
-from app.ingestion.catalog_sync import build_catalog_plan, catalog_needs_rebuild
+from app.ingestion.catalog_sync import (
+    AUTO_TAG,
+    auto_catalog_nodes_for_document,
+    build_catalog_plan,
+    catalog_needs_rebuild,
+    _doc_tag,
+)
 
 
 def _doc(**kwargs):
@@ -86,3 +92,18 @@ def test_catalog_rebuild_when_legacy_topic_tree_exists():
     assert not catalog_needs_rebuild([unit_leaf], unit_count=3)
     assert catalog_needs_rebuild([], unit_count=2)
     assert not catalog_needs_rebuild([], unit_count=0)
+
+
+def test_deleting_document_selects_only_that_document_auto_catalog():
+    doc_tag = _doc_tag("doc-1")
+    other_tag = _doc_tag("doc-2")
+    article = SimpleNamespace(id="n1", path="Hybrid RX", related_concepts=[AUTO_TAG, doc_tag])
+    section = SimpleNamespace(id="n2", path="Hybrid RX/01 II", related_concepts=[AUTO_TAG, doc_tag])
+    other = SimpleNamespace(id="n3", path="CDC Guide", related_concepts=[AUTO_TAG, other_tag])
+    manual = SimpleNamespace(id="n4", path="手搓分类", related_concepts=["自定义"])
+    doomed = auto_catalog_nodes_for_document([article, section, other, manual], "doc-1")
+    assert {node.id for node in doomed} == {"n1", "n2"}
+    from app.ingestion.catalog_sync import document_id_from_related
+
+    assert document_id_from_related(article.related_concepts) == "doc-1"
+    assert not document_id_from_related(manual.related_concepts)

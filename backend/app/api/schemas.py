@@ -1,5 +1,5 @@
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from app.domain.extraction_policy import ExtractionPolicy
 
 
@@ -111,14 +111,39 @@ class MetadataFieldDelete(BaseModel):
     key: str
 
 
+class EvaluationCaseConfig(BaseModel):
+    reference_answer: str = Field(default="", max_length=20000)
+    answer_points: list[str] = Field(default_factory=list, max_length=50)
+    expected_kinds: list[Literal["figure", "equation", "text", "table"]] = Field(default_factory=list)
+
+
 class GoldenCaseCreate(BaseModel):
-    dataset_name: str = "default"
-    question: str
-    required_knowledge: list[str] = Field(default_factory=list)
-    optional_knowledge: list[str] = Field(default_factory=list)
-    forbidden_knowledge: list[str] = Field(default_factory=list)
+    dataset_name: str = Field(default="default", min_length=1, max_length=200)
+    question: str = Field(min_length=1, max_length=4000)
+    required_knowledge: list[str] = Field(default_factory=list, max_length=100)
+    optional_knowledge: list[str] = Field(default_factory=list, max_length=100)
+    forbidden_knowledge: list[str] = Field(default_factory=list, max_length=100)
     expected_roles: list[str] = Field(default_factory=list)
     kb_id: str | None = None
+    evaluation_config: EvaluationCaseConfig = Field(default_factory=EvaluationCaseConfig)
+
+    @field_validator("dataset_name", "question")
+    @classmethod
+    def nonblank(cls, value):
+        if not value.strip():
+            raise ValueError("内容不能为空")
+        return value.strip()
+
+    @field_validator("required_knowledge", "optional_knowledge", "forbidden_knowledge")
+    @classmethod
+    def clean_evidence(cls, values):
+        result = list(dict.fromkeys(value.strip() for value in values if value.strip()))
+        for value in result:
+            if value.startswith(("id:", "keyword:", "title:")) and not value.split(":", 1)[1].strip():
+                raise ValueError("证据标注不能为空")
+            if value.startswith("anchor:") and ("#" not in value or not all(value[7:].split("#", 1))):
+                raise ValueError("锚点格式为 anchor:文档ID#fig:4")
+        return result
 
 
 class ConfirmStrategy(BaseModel):

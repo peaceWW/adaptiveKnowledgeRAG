@@ -8,6 +8,15 @@ from app.domain.enums import KnowledgeType, SemanticRole, SourceLevel
 from app.domain.strategy import DocumentContext, KnowledgeUnitDraft
 from app.ingestion.academic_parse import render_region_png
 from app.ingestion.extractor import _extract_concepts, _infer_role, _split_blocks
+from app.ingestion.figure_equation_bundle import (
+    FIG_REF_RE,
+    equation_content,
+    fig_eq_concepts,
+    figure_content,
+    figure_equation_pairs,
+    infer_engineering_topic,
+    merge_concepts,
+)
 from app.observability.pipeline_log import draft_digest, step as pipeline_step
 from app.prompts.loader import load_prompt
 from app.storage.paths import image_refs
@@ -16,10 +25,9 @@ DEFAULT_PROMPT = """你是芯片设计工程师，从章节原文抽取可检索
 {"units":[{"title":"","semantic_role":"principle","content":"","concepts":[],"importance":"core","source_page":1,"relations":[],"unit_meta":{}}]}
 """
 DEFAULT_FIGURE_PROMPT = """你是芯片设计工程师，只描述图中可见内容。输出 JSON：
-{"figure_type":"","description":"","components":[],"parameters":{}}
+{"figure_type":"","description":"","components":[],"parameters":{},"engineering_topic":""}
 不得编造未标出的参数。
 """
-FIG_REF_RE = re.compile(r"\bFig(?:ure)?\.?\s*(\d+[A-Za-z]?)\b", re.I)
 PAPER_ROLES = {
     SemanticRole.DEFINITION,
     SemanticRole.EXPLANATION,
@@ -71,6 +79,7 @@ def extract_paper_units(
         drafts.extend(_heuristic_section_units(context, knowledge_type, allowed))
         semantic_source = "heuristic_section"
     unique = _dedupe_drafts(drafts)
+    _bind_figure_equations(unique, context)
     pipeline_step(
         "ingest",
         "chunk",
@@ -183,7 +192,7 @@ def _section_units(
                 semantic_role=role,
                 knowledge_type=knowledge_type,
                 importance="core" if role in {SemanticRole.PRINCIPLE, SemanticRole.SUMMARY, SemanticRole.METRIC} else "supporting",
-                concepts=_extract_concepts(text or title),
+                concepts=merge_concepts(_extract_concepts(text or title), fig_eq_concepts(text or title, context.structure, f"sec:{section_id}")),
                 source_span=text[:500],
                 source_chapter=section_id[:64],
                 source_section=str(section.get("title") or "")[:80],
@@ -235,21 +244,17 @@ def _equation_unit(context: DocumentContext, eq: dict[str, Any], knowledge_type:
             eq["meaning"] = vision.get("meaning")
         if vision.get("variables"):
             eq["variables"] = vision.get("variables")
-    parts = [f"Equation ({eq_id})"]
-    if latex:
-        parts.append(f"$$\n{latex}\n$$")
-    if raw:
-        parts.append(f"Source: {raw}")
     nearby = str(eq.get("nearby_text") or "")
-    if nearby:
-        parts.append(f"Context: {nearby}")
     meaning = str(eq.get("meaning") or "")
     variables = eq.get("variables") or {}
-    if meaning:
-        parts.append(f"Meaning: {meaning}")
-    if variables:
-        parts.append("Symbols: " + ", ".join(f"{key}={value}" for key, value in variables.items()))
-    body = "\n".join(parts)
+    body = equation_content(
+        eq_id,
+        latex=latex,
+        raw=raw,
+        nearby=nearby,
+        meaning=meaning,
+        variables=variables if isinstance(variables, dict) else {},
+    )
     parent_anchor = _parent_anchor_for_inventory(context.structure, "eq", eq_id, int(eq.get("page") or 1))
     return KnowledgeUnitDraft(
         title=f"Equation ({eq_id})",
@@ -257,7 +262,7 @@ def _equation_unit(context: DocumentContext, eq: dict[str, Any], knowledge_type:
         semantic_role=SemanticRole.FORMULA,
         knowledge_type=knowledge_type,
         importance="core",
-        concepts=_extract_concepts(body),
+        concepts=merge_concepts(_extract_concepts(body), [f"Eq.({eq_id})"]),
         source_span=(nearby or raw)[:500],
         source_chapter=_section_for_page(context.structure, int(eq.get("page") or 1)),
         source_section=f"eq:{eq_id}",
@@ -344,16 +349,23 @@ def _figure_unit(
     figure_type = str(vision.get("figure_type") or "")
     components = vision.get("components") or []
     parameters = vision.get("parameters") or {}
-    content_parts = [f"Fig. {fig_id}. {caption}".strip()]
-    if figure_type:
-        content_parts.append(f"Type: {figure_type}")
-    if components:
-        content_parts.append("Components: " + ", ".join(str(item) for item in components))
-    if parameters:
-        content_parts.append("Parameters: " + ", ".join(f"{k}={v}" for k, v in parameters.items()))
-    if description:
-        content_parts.append(f"Description: {description}")
-    content = "\n".join(content_parts)
+    paper_title = str(((context.structure or {}).get("metadata") or {}).get("title") or context.filename)
+    engineering_topic = infer_engineering_topic(
+        caption,
+        description,
+        " ".join(str(item) for item in components),
+        paper_title,
+        suggested=str(vision.get("engineering_topic") or ""),
+    )
+    content = figure_content(
+        fig_id,
+        caption,
+        figure_type=figure_type,
+        components=components,
+        parameters=parameters if isinstance(parameters, dict) else {},
+        description=description,
+        engineering_topic=engineering_topic,
+    )
     parent_anchor = _parent_anchor_for_inventory(context.structure, "fig", fig_id, int(fig.get("page") or 1))
     relations = [{"type": "BELONGS_TO", "to_key": parent_anchor}] if parent_anchor else []
     if parent_anchor:
@@ -364,7 +376,7 @@ def _figure_unit(
         semantic_role=role,
         knowledge_type=knowledge_type,
         importance="supporting",
-        concepts=_extract_concepts(content),
+        concepts=merge_concepts(_extract_concepts(content), [f"Fig.{fig_id}", engineering_topic]),
         source_span=caption[:500],
         source_chapter=_section_for_page(context.structure, int(fig.get("page") or 1)),
         source_section=f"fig:{fig_id}",
@@ -385,6 +397,7 @@ def _figure_unit(
             "figure_type": figure_type,
             "components": components,
             "parameters": parameters,
+            "engineering_topic": engineering_topic,
             "parent_anchor": parent_anchor,
         },
         source_level=SourceLevel.AI_GENERATED.value if description else SourceLevel.REVIEWED.value,
@@ -452,7 +465,10 @@ def _heuristic_section_units(
                     semantic_role=use_role,
                     knowledge_type=knowledge_type,
                     importance="core" if use_role in {SemanticRole.PRINCIPLE, SemanticRole.SUMMARY, SemanticRole.METRIC} else "supporting",
-                    concepts=_extract_concepts(block),
+                    concepts=merge_concepts(
+                        _extract_concepts(block),
+                        fig_eq_concepts(block, context.structure, f"sec:{section.get('id')}"),
+                    ),
                     source_span=block[:500],
                     source_chapter=str(section.get("id") or ""),
                     source_section=str(section.get("title") or "")[:80],
@@ -496,7 +512,10 @@ def _unit_from_llm_item(
         semantic_role=role,
         knowledge_type=knowledge_type,
         importance=str(item.get("importance") or "core"),
-        concepts=list(item.get("concepts") or _extract_concepts(content))[:8],
+        concepts=merge_concepts(
+            list(item.get("concepts") or _extract_concepts(content)),
+            fig_eq_concepts(content, context.structure, parent_anchor),
+        )[:12],
         source_span=content[:500],
         source_chapter=str(section.get("id") or ""),
         source_section=str(section.get("title") or "")[:80],
@@ -558,9 +577,61 @@ def _maybe_vision_figure(context: DocumentContext, fig: dict[str, Any]) -> dict[
             "figure_type": str(result.get("figure_type") or "").strip(),
             "components": result.get("components") or [],
             "parameters": result.get("parameters") or {},
+            "engineering_topic": str(result.get("engineering_topic") or "").strip(),
         }
     except Exception:
         return {}
+
+
+def _bind_figure_equations(drafts: list[KnowledgeUnitDraft], context: DocumentContext) -> None:
+    """同页或 caption 互指时补 HAS_EQUATION / HAS_FIGURE；章节单元补 Fig/Eq 概念。"""
+    figures = []
+    equations = []
+    for draft in drafts:
+        meta = draft.unit_meta or {}
+        kind = str(meta.get("kind") or "")
+        if kind == "figure":
+            figures.append(
+                {
+                    "fig_id": meta.get("fig_id"),
+                    "caption": meta.get("caption") or "",
+                    "content": draft.content,
+                    "page": draft.source_page,
+                    "source_page": draft.source_page,
+                }
+            )
+        elif kind == "equation":
+            equations.append(
+                {
+                    "eq_id": meta.get("eq_id"),
+                    "nearby_text": draft.source_span or "",
+                    "content": draft.content,
+                    "page": draft.source_page,
+                    "source_page": draft.source_page,
+                }
+            )
+    pair_keys = {(f"fig:{fig_id}", f"eq:{eq_id}") for fig_id, eq_id in figure_equation_pairs(figures, equations)}
+    by_anchor = {str((draft.unit_meta or {}).get("anchor") or ""): draft for draft in drafts}
+    for fig_key, eq_key in pair_keys:
+        fig_draft = by_anchor.get(fig_key)
+        eq_draft = by_anchor.get(eq_key)
+        if not fig_draft or not eq_draft:
+            continue
+        fig_draft.relations = list(fig_draft.relations or []) + [{"type": "HAS_EQUATION", "to_key": eq_key}]
+        eq_draft.relations = list(eq_draft.relations or []) + [{"type": "HAS_FIGURE", "to_key": fig_key}]
+        fig_draft.relations = _filter_known_relations(fig_draft.relations, context)
+        eq_draft.relations = _filter_known_relations(eq_draft.relations, context)
+    structure = context.structure or {}
+    for draft in drafts:
+        meta = draft.unit_meta or {}
+        kind = str(meta.get("kind") or "")
+        if kind not in {"concept", "section"}:
+            continue
+        section_anchor = str(meta.get("parent_anchor") or meta.get("anchor") or "")
+        draft.concepts = merge_concepts(
+            draft.concepts,
+            fig_eq_concepts(draft.content, structure, section_anchor),
+        )
 
 
 def _load_figure_prompt() -> str:

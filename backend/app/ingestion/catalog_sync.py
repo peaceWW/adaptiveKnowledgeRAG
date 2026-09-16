@@ -190,21 +190,26 @@ def catalog_needs_rebuild(nodes: list[KnowledgeCatalog], unit_count: int) -> boo
     return (not has_unit_leaf) or has_legacy
 
 
-async def _prune_auto_nodes(session: AsyncSession, kb_id: str, document_id: str | None = None, legacy: bool = False) -> int:
-    """删除自动生成的旧节点（先叶子后祖先），避免和手搓目录冲突。"""
-    nodes = (
-        await session.execute(select(KnowledgeCatalog).where(KnowledgeCatalog.kb_id == kb_id))
-    ).scalars().all()
-    doomed: list[KnowledgeCatalog] = []
-    doc_tag = _doc_tag(document_id) if document_id else ""
+def document_id_from_related(related: list | None) -> str:
+    for item in related or []:
+        text = str(item)
+        if text.startswith(DOC_PREFIX):
+            return text[len(DOC_PREFIX) :]
+    return ""
+
+
+def auto_catalog_nodes_for_document(nodes: list[KnowledgeCatalog], document_id: str) -> list[KnowledgeCatalog]:
+    """选出该文档抽取时自动写入的文章/章节/知识点节点，供删除文档时整棵摘掉。"""
+    doc_tag = _doc_tag(document_id)
+    matched: list[KnowledgeCatalog] = []
     for node in nodes:
         related = node.related_concepts or []
-        auto = AUTO_TAG in related
-        if document_id and auto and doc_tag in related:
-            doomed.append(node)
-            continue
-        if legacy and auto and str(node.path or "").split("/")[0] in LEGACY_ROOTS:
-            doomed.append(node)
+        if AUTO_TAG in related and doc_tag in related:
+            matched.append(node)
+    return matched
+
+
+async def _delete_catalog_nodes(session: AsyncSession, doomed: list[KnowledgeCatalog]) -> int:
     if not doomed:
         return 0
     ids = [node.id for node in doomed]
@@ -213,6 +218,48 @@ async def _prune_auto_nodes(session: AsyncSession, kb_id: str, document_id: str 
         await session.delete(node)
     await session.flush()
     return len(doomed)
+
+
+async def _prune_auto_nodes(session: AsyncSession, kb_id: str, document_id: str | None = None, legacy: bool = False) -> int:
+    """删除自动生成的旧节点（先叶子后祖先），避免和手搓目录冲突。"""
+    nodes = (
+        await session.execute(select(KnowledgeCatalog).where(KnowledgeCatalog.kb_id == kb_id))
+    ).scalars().all()
+    doomed: list[KnowledgeCatalog] = []
+    if document_id:
+        doomed.extend(auto_catalog_nodes_for_document(nodes, document_id))
+    if legacy:
+        for node in nodes:
+            related = node.related_concepts or []
+            if AUTO_TAG in related and str(node.path or "").split("/")[0] in LEGACY_ROOTS:
+                if node not in doomed:
+                    doomed.append(node)
+    return await _delete_catalog_nodes(session, doomed)
+
+
+async def remove_catalog_for_document(session: AsyncSession, kb_id: str | None, document_id: str) -> int:
+    """文档删除后摘掉其自动目录树；手搓节点（无 __auto__ / 无该文标记）保留。"""
+    if not kb_id or not document_id:
+        return 0
+    return await _prune_auto_nodes(session, kb_id, document_id=document_id, legacy=False)
+
+
+async def prune_orphan_auto_catalogs(session: AsyncSession, kb_id: str) -> int:
+    """清掉文档已不存在、但仍挂在知识目录里的自动节点（历史漏删）。"""
+    live_ids = set(
+        (await session.execute(select(Document.id).where(Document.kb_id == kb_id))).scalars().all()
+    )
+    nodes = (
+        await session.execute(select(KnowledgeCatalog).where(KnowledgeCatalog.kb_id == kb_id))
+    ).scalars().all()
+    doomed = [
+        node
+        for node in nodes
+        if AUTO_TAG in (node.related_concepts or [])
+        and (doc_id := document_id_from_related(node.related_concepts))
+        and doc_id not in live_ids
+    ]
+    return await _delete_catalog_nodes(session, doomed)
 
 
 async def sync_catalog_from_document(session: AsyncSession, doc: Document, units: list[KnowledgeUnit]) -> dict[str, Any]:

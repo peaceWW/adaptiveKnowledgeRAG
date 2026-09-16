@@ -2,8 +2,8 @@ const {createServer}=require('node:http');
 const fs=require('node:fs'), path=require('node:path'), assert=require('node:assert/strict');
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const root=path.resolve(__dirname,'../dist'), out=path.resolve(__dirname,'../../artifacts/frontend');
-const answer='## 工作原理\n\n**ADC** 将模拟信号转换为数字信号。\n\n- 保留信号信息\n- 降低处理复杂度\n\n| 模块 | 作用 |\n| --- | --- |\n| ADC | 采样 |\n\n公式：\\(V_t = \\alpha V_{t-1}\\)\n\n<script>window.injected=true</script>';
-const cite={title:'接收机结构图',document_id:'doc',image_key:'test.svg',page:2};
+const answer='## 架构图\n\n[[figure:fig-1]]\n\n## 工作原理\n\n**ADC** 将模拟信号转换为数字信号。\n\n- 保留信号信息\n- 降低处理复杂度\n\n| 模块 | 作用 |\n| --- | --- |\n| ADC | 采样 |\n\n公式：\\(V_t = \\alpha V_{t-1}\\)\n\n<script>window.injected=true</script>';
+const cite={knowledge_id:'fig-1',kind:'figure',title:'接收机结构图',document_id:'doc',image_key:'test.svg',page:2};
 let calls=[];
 const server=createServer(async(req,res)=>{
  const url=new URL(req.url,'http://localhost');
@@ -20,7 +20,7 @@ const server=createServer(async(req,res)=>{
   let data=[];
   if(url.pathname==='/api/knowledge-bases')data=[{id:'kb',name:'芯片设计知识库'}];
   if(url.pathname==='/api/chat/sessions')data=[{id:'s1',title:'RX 为什么使用 ADC',time:'14:12'}];
-  if(url.pathname==='/api/chat/sessions/s1')data={turns:[{query:'RX 为什么使用 ADC',answer,citations:[cite]}]};
+  if(url.pathname==='/api/chat/sessions/s1')data={turns:[{query:'RX 为什么使用 ADC',answer:answer.replace('[[figure:fig-1]]', '[图片](test.svg)'),citations:[cite]}]};
   res.setHeader('Content-Type','application/json');res.end(JSON.stringify(data));return;
  }
  let file=path.join(root,url.pathname);if(!fs.existsSync(file)||fs.statSync(file).isDirectory())file=path.join(root,'index.html');
@@ -39,6 +39,7 @@ const server=createServer(async(req,res)=>{
   await page.getByRole('button',{name:'复制回答'}).waitFor();
   assert.equal(await page.locator('.answer table').count(),1);assert.equal(await page.locator('.answer .katex').count(),1);assert.equal(await page.evaluate(()=>window.injected),undefined);
   await page.locator('.figure-grid img').waitFor();await page.waitForFunction(()=>document.querySelector('.figure-grid img').naturalWidth>0);
+  assert.equal(await page.locator('.answer').innerText().then(t=>t.includes('[[figure:')),false);assert.equal(await page.locator('.answer .asset-url').count(),0);assert.equal(await page.locator('.evidence-block').count(),0);
   await page.locator('.figure-grid .ant-image-mask').click();await page.locator('.ant-image-preview-img').waitFor();await page.locator('.ant-image-preview-operations-operation').first().click(); await page.locator('.ant-image-preview-img').waitFor({state:'hidden'}); await page.locator('.conversation').evaluate(el=>el.scrollTop=0);
   fs.mkdirSync(out,{recursive:true});await page.screenshot({path:path.join(out,'chat-desktop.png'),fullPage:true});
   await page.locator('.input-box textarea').fill('请继续解释');await page.locator('.input-box textarea').press('Enter');await page.locator('.turn').nth(1).getByRole('button',{name:'复制回答'}).waitFor();assert.equal(calls[1].session_id,'s1');

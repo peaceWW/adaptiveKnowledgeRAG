@@ -39,6 +39,51 @@ def pdf_manifest(raw: bytes) -> dict:
         }
 
 
+def _clip01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def page_text_layer(raw: bytes, page_number: int) -> dict:
+    """抽出一页文字及相对 page.rect 的归一化包围盒，供前端叠在渲染图上选中复制。
+
+    get_text('dict') 的 bbox 相对未旋转页；乘 rotation_matrix 后与 get_pixmap 画面一致。
+    """
+    with _pdf_lock, _open_pdf(raw) as pdf:
+        if not 1 <= page_number <= pdf.page_count:
+            raise HTTPException(404, "PDF 页码超出范围")
+        page = pdf[page_number - 1]
+        page_rect = page.rect
+        width, height = page_rect.width, page_rect.height
+        if width <= 0 or height <= 0:
+            raise HTTPException(422, "PDF 页面尺寸无效")
+        extracted = page.get_text("dict")
+        spans: list[dict] = []
+        for block in extracted.get("blocks") or []:
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines") or []:
+                text = "".join(str(span.get("text") or "") for span in (line.get("spans") or []))
+                if not text.strip():
+                    continue
+                box = fitz.Rect(line["bbox"]) * page.rotation_matrix
+                box &= page_rect
+                if box.is_empty or box.width <= 0 or box.height <= 0:
+                    continue
+                spans.append({
+                    "text": text,
+                    "x": _clip01(box.x0 / width),
+                    "y": _clip01(box.y0 / height),
+                    "w": _clip01(box.width / width),
+                    "h": _clip01(box.height / height),
+                })
+        return {
+            "page": page_number,
+            "width": width,
+            "height": height,
+            "spans": spans,
+        }
+
+
 def render_pdf_page(raw: bytes, page_number: int, width: int = 1600) -> bytes:
     with _pdf_lock, _open_pdf(raw) as pdf:
         if not 1 <= page_number <= pdf.page_count:
