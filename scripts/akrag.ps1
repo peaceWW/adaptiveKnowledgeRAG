@@ -14,6 +14,9 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $RunDir = Join-Path $Root ".run"
 $FrontendDir = Join-Path $Root "frontend"
+$VenvDir = Join-Path $Root ".venv"
+$VenvScripts = Join-Path $VenvDir "Scripts"
+$VenvPython = Join-Path $VenvScripts "python.exe"
 $BackendPidFile = Join-Path $RunDir "backend.pid"
 $FrontendPidFile = Join-Path $RunDir "frontend.pid"
 $BackendPort = 8000
@@ -30,14 +33,21 @@ function Add-PathDir([string]$Dir) {
     }
 }
 
-function Initialize-ToolPath {
-    $pythonRoot = Join-Path $env:LOCALAPPDATA "Programs\Python"
-    if (Test-Path $pythonRoot) {
-        Get-ChildItem $pythonRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-            Add-PathDir $_.FullName
-            Add-PathDir (Join-Path $_.FullName "Scripts")
-        }
+function Isolate-ProjectEnv {
+    # 绑定本仓库 .venv，去掉全局 PYTHONPATH/PIP_TARGET，避免多项目、多 Python 版本串包
+    foreach ($name in @('PYTHONPATH', 'PYTHONHOME', 'PIP_TARGET', 'PIP_USER', 'PYTHONSTARTUP')) {
+        Remove-Item "Env:$name" -ErrorAction SilentlyContinue
     }
+    $env:PYTHONNOUSERSITE = '1'
+    $env:VIRTUAL_ENV = $VenvDir
+    $env:UV_PROJECT_ENVIRONMENT = $VenvDir
+    if (Test-Path $VenvPython) {
+        $env:PATH = "$VenvScripts;$env:PATH"
+    }
+}
+
+function Initialize-ToolPath {
+    # 只补 uv / Node，不把本机所有 Python 版本塞进 PATH
     @(
         "$env:USERPROFILE\.local\bin",
         "$env:USERPROFILE\.cargo\bin",
@@ -47,19 +57,19 @@ function Initialize-ToolPath {
     ) | ForEach-Object { Add-PathDir $_ }
 }
 
-function Get-PythonExe {
+function Get-BootstrapPython {
+    # 仅用于首次安装 uv；应用运行必须走项目 .venv
+    $cmd = Get-Command python -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source -notlike "*WindowsApps*" -and $cmd.Source -notlike "*\.venv\*") {
+        return $cmd.Source
+    }
     $pythonRoot = Join-Path $env:LOCALAPPDATA "Programs\Python"
     if (Test-Path $pythonRoot) {
-        $found = Get-ChildItem $pythonRoot -Directory -ErrorAction SilentlyContinue |
+        return Get-ChildItem $pythonRoot -Directory -ErrorAction SilentlyContinue |
             Sort-Object Name -Descending |
             ForEach-Object { Join-Path $_.FullName "python.exe" } |
             Where-Object { Test-Path $_ } |
             Select-Object -First 1
-        if ($found) { return $found }
-    }
-    $cmd = Get-Command python -ErrorAction SilentlyContinue
-    if ($cmd -and $cmd.Source -notlike "*WindowsApps*") {
-        return $cmd.Source
     }
     return $null
 }
@@ -67,7 +77,7 @@ function Get-PythonExe {
 function Ensure-Uv {
     if (Test-CommandExists "uv") { return }
     Write-Info "未找到 uv，尝试自动安装"
-    $python = Get-PythonExe
+    $python = Get-BootstrapPython
     if ($python) {
         & $python -m pip install uv
         Initialize-ToolPath
@@ -84,6 +94,13 @@ function Ensure-Uv {
     }
 }
 
+function Assert-ProjectVenv {
+    if (-not (Test-Path $VenvPython)) {
+        throw "未找到项目虚拟环境 $VenvPython。请先执行 deploy.bat（会在本仓库创建 .venv）"
+    }
+}
+
+Isolate-ProjectEnv
 Initialize-ToolPath
 
 function Ensure-RunDir {
@@ -205,11 +222,15 @@ function Invoke-Deploy {
     Ensure-Env -PreferSqlite (-not $useInfra)
     New-Item -ItemType Directory -Force -Path (Join-Path $Root "data") | Out-Null
 
-    Write-Info "安装 Python 依赖 (uv sync)"
+    Write-Info "安装 Python 依赖到本仓库 .venv (uv sync)"
     Push-Location $Root
     try {
+        $env:UV_PROJECT_ENVIRONMENT = $VenvDir
         uv sync
         if ($LASTEXITCODE -ne 0) { throw "uv sync 失败" }
+        Isolate-ProjectEnv
+        Assert-ProjectVenv
+        Write-Info "项目解释器: $VenvPython"
         Write-Info "安装前端依赖 (npm install)"
         Push-Location $FrontendDir
         try {
@@ -253,19 +274,20 @@ function Start-Backend {
         Write-Warn "后端已在端口 $BackendPort 运行"
         return
     }
-    Ensure-Uv
+    Assert-ProjectVenv
+    Isolate-ProjectEnv
     Ensure-RunDir
-    $uv = (Get-Command uv).Source
     $log = Join-Path $RunDir "backend.log"
     $err = Join-Path $RunDir "backend.err"
-    $proc = Start-Process -FilePath $uv -ArgumentList @(
-        "run", "uvicorn", "app.main:app",
+    # 直接用项目 .venv 的 python -m uvicorn，不走全局 uv/python
+    $proc = Start-Process -FilePath $VenvPython -ArgumentList @(
+        "-m", "uvicorn", "app.main:app",
         "--app-dir", "backend",
         "--host", "0.0.0.0",
         "--port", "$BackendPort"
     ) -WorkingDirectory $Root -RedirectStandardOutput $log -RedirectStandardError $err -WindowStyle Hidden -PassThru
     $proc.Id | Set-Content $BackendPidFile
-    Write-Info "后端已启动 PID=$($proc.Id)，日志 $log"
+    Write-Info "后端已启动 PID=$($proc.Id) python=$VenvPython，日志 $log"
 }
 
 function Start-Frontend {
@@ -331,6 +353,11 @@ function Invoke-Status {
     $frontend = if (Test-PortListening $FrontendPort) { "running" } else { "stopped" }
     Write-Host "backend  : $backend   http://0.0.0.0:$BackendPort/"
     Write-Host "frontend : $frontend   http://0.0.0.0:$FrontendPort/"
+    if (Test-Path $VenvPython) {
+        Write-Host "python   : $VenvPython"
+    } else {
+        Write-Host "python   : missing (.venv). Run deploy.bat first"
+    }
     if (Test-CommandExists "docker") {
         Write-Host "docker   : installed"
     } else {

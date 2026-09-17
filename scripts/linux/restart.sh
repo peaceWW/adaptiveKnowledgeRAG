@@ -1,2 +1,5 @@
 #!/usr/bin/env bash
-exec "$(cd "$(dirname "$0")/.." && pwd)/akrag.sh" restart "$@"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+. "$DIR/_isolate.sh"
+exec "$(cd "$DIR/.." && pwd)/akrag.sh" restart "$@"

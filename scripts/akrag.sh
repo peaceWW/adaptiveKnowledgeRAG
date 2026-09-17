@@ -7,6 +7,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_DIR="$ROOT/.run"
 FRONTEND_DIR="$ROOT/frontend"
+VENV_DIR="$ROOT/.venv"
+VENV_BIN="$VENV_DIR/bin"
+VENV_PYTHON="$VENV_BIN/python"
 BACKEND_PID_FILE="$RUN_DIR/backend.pid"
 FRONTEND_PID_FILE="$RUN_DIR/frontend.pid"
 BACKEND_PORT=8000
@@ -31,6 +34,26 @@ warn() { printf '\033[33m[akrag]\033[0m %s\n' "$*"; }
 err() { printf '\033[31m[akrag]\033[0m %s\n' "$*"; }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+isolate_project_env() {
+  # 绑定本仓库 .venv，去掉全局 PYTHONPATH/PIP_TARGET，避免多项目串包
+  unset PYTHONPATH PYTHONHOME PIP_TARGET PIP_USER PYTHONSTARTUP
+  export PYTHONNOUSERSITE=1
+  export VIRTUAL_ENV="$VENV_DIR"
+  export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
+  if [[ -x "$VENV_PYTHON" ]]; then
+    export PATH="$VENV_BIN:$PATH"
+  fi
+}
+
+assert_project_venv() {
+  if [[ ! -x "$VENV_PYTHON" ]]; then
+    err "未找到项目虚拟环境: $VENV_PYTHON。请先执行 ./deploy.sh（会在本仓库创建 .venv）"
+    exit 1
+  fi
+}
+
+isolate_project_env
 
 port_pids() {
   local port="$1"
@@ -159,8 +182,15 @@ cmd_deploy() {
   fi
   mkdir -p "$ROOT/data"
 
-  info "安装 Python 依赖 (uv sync)"
-  (cd "$ROOT" && uv sync)
+  info "安装 Python 依赖到本仓库 .venv (uv sync)"
+  (
+    cd "$ROOT"
+    export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
+    uv sync
+  )
+  isolate_project_env
+  assert_project_venv
+  info "项目解释器: $VENV_PYTHON"
   info "安装前端依赖 (npm install)"
   (cd "$FRONTEND_DIR" && npm install)
 
@@ -175,18 +205,17 @@ start_backend() {
     warn "后端已在端口 $BACKEND_PORT 运行"
     return 0
   fi
-  if ! have_cmd uv; then
-    err "未找到 uv，请先执行 deploy"
-    exit 1
-  fi
+  assert_project_venv
+  isolate_project_env
   mkdir -p "$RUN_DIR"
   (
     cd "$ROOT"
-    nohup uv run uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port "$BACKEND_PORT" \
+    # 直接用项目 .venv 的 python -m uvicorn，不走全局 uv/python
+    nohup "$VENV_PYTHON" -m uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port "$BACKEND_PORT" \
       >> "$RUN_DIR/backend.log" 2>&1 &
     echo $! > "$BACKEND_PID_FILE"
   )
-  info "后端已启动 PID=$(cat "$BACKEND_PID_FILE")，日志 $RUN_DIR/backend.log"
+  info "后端已启动 PID=$(cat "$BACKEND_PID_FILE") python=$VENV_PYTHON，日志 $RUN_DIR/backend.log"
 }
 
 start_frontend() {
@@ -254,6 +283,11 @@ cmd_status() {
   port_listening "$FRONTEND_PORT" && frontend="running"
   echo "backend  : $backend   http://0.0.0.0:${BACKEND_PORT}/"
   echo "frontend : $frontend   http://0.0.0.0:${FRONTEND_PORT}/"
+  if [[ -x "$VENV_PYTHON" ]]; then
+    echo "python   : $VENV_PYTHON"
+  else
+    echo "python   : missing (.venv). Run ./deploy.sh first"
+  fi
   if have_cmd docker; then
     echo "docker   : installed"
   else

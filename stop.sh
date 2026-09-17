@@ -1,2 +1,5 @@
 #!/usr/bin/env bash
-exec "$(cd "$(dirname "$0")" && pwd)/scripts/akrag.sh" stop "$@"
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+. "$ROOT/scripts/linux/_isolate.sh"
+exec "$ROOT/scripts/akrag.sh" stop "$@"

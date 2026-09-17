@@ -90,9 +90,139 @@ AdaptiveKnowledgeRAG/
 - 可选：Docker / Docker Compose（完整中间件）
 - 可选：`MODEL_API_KEY`（真实 LLM；留空亦可运行。千问示例见下方配置）
 
+Python 依赖写在仓库根目录 `pyproject.toml` / `uv.lock`，由 **uv** 安装到项目 `.venv`。没有 `request.txt` / `requirements.txt`。前端依赖在 `frontend/package.json`。
+
+## 环境配置与依赖安装
+
+以下命令均在**仓库根目录**执行。首次克隆后按「配置 → 装包 → 启动」即可。
+
+### 1. 配置文件
+
+```bash
+# Linux / macOS
+cp .env.example .env
+
+# Windows PowerShell
+Copy-Item .env.example .env
+```
+
+无 Docker 时把 `.env` 里的数据库改成 SQLite：
+
+```env
+DATABASE_URL=sqlite+aiosqlite:///./data/akrag.db
+```
+
+完整中间件（Postgres / Redis / Qdrant / MinIO / ES / Neo4j）的默认连接见下方「配置」。模型相关项同样写在 `.env`：`MODEL_BASE_URL`、`MODEL_API_KEY`、`MODEL_LLM` 等。
+
+### 2. 安装前清理干扰变量（Windows 必看）
+
+若系统或用户环境里设置了 `PYTHONPATH` / `PIP_TARGET`（例如 `D:\workspace\pip`），**手动**用系统 Python 启动时会优先加载那套目录里的残缺包，出现：
+
+```text
+ModuleNotFoundError: No module named 'orjson.orjson'
+```
+
+`start.bat` / `deploy.bat` 等管理脚本已自动清空这些变量并使用项目 `.venv`。若不用脚本、在终端里手动启动，仍需先清掉：
+
+```powershell
+# Windows PowerShell
+$env:PYTHONPATH = ''
+$env:PIP_TARGET = ''
+```
+
+```bash
+# Linux / macOS
+unset PYTHONPATH PIP_TARGET
+```
+
+建议从「系统环境变量」中删除这两项，避免每次新开终端再次污染 `.venv`。
+
+### 3. 安装 Python 包
+
+```bash
+# 运行依赖（写入 .venv）
+uv sync
+
+# 开发依赖（pytest、ruff）
+uv sync --extra dev
+```
+
+补装或强制重装某个包（例如启动报 `orjson` 原生扩展缺失）：
+
+```bash
+uv pip install --reinstall orjson
+```
+
+核对虚拟环境：
+
+```bash
+# 应指向项目内 .venv
+uv run python -c "import sys, orjson; print(sys.executable); print(orjson.__file__)"
+```
+
+### 4. 安装前端包
+
+```bash
+cd frontend
+npm install
+cd ..
+```
+
+### 5. 启动命令
+
+先起后端，再起前端。后端必须在仓库根目录启动，以便读取 `.env` 与 `data/`。
+
+**Windows PowerShell：**
+
+```powershell
+$env:PYTHONPATH = ''
+$env:PIP_TARGET = ''
+
+# 后端 :8000
+uv run uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port 8000
+
+# 另开一个终端：前端 :5173
+cd frontend
+npm run dev
+```
+
+也可用 `.venv` 解释器（同样先清空 `PYTHONPATH`）：
+
+```powershell
+$env:PYTHONPATH = ''
+$env:PIP_TARGET = ''
+.venv\Scripts\python.exe -m uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port 8000
+```
+
+**Linux / macOS：**
+
+```bash
+unset PYTHONPATH PIP_TARGET
+uv run uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port 8000
+
+# 另开终端
+cd frontend && npm run dev
+```
+
+可选中间件：
+
+```bash
+docker compose up -d
+```
+
+启动成功后：
+
+| 地址 | 说明 |
+| --- | --- |
+| http://localhost:5173/ | 控制台 |
+| http://127.0.0.1:8000/health | 后端健康检查 |
+| http://127.0.0.1:8000/docs | OpenAPI |
+
 ## 一键部署与启停
 
 仓库根目录即可执行。首次请先 **deploy**，再 **start**。
+
+`deploy` / `start` / `restart` 等脚本会绑定**本仓库** `.venv`：清空 `PYTHONPATH`、`PIP_TARGET`，后端用 `.venv` 里的 Python 启动，不走全局解释器，避免多项目、多版本互相损坏依赖。`status` 会打印当前 `python` 路径。
 
 ### Windows
 
@@ -153,9 +283,9 @@ chmod +x deploy.sh start.sh stop.sh restart.sh status.sh scripts/akrag.sh script
 
 | 命令 | 作用 |
 | --- | --- |
-| `deploy` | 创建 `.env`、`uv sync`、`npm install`；无 Docker 时数据库改为 SQLite |
+| `deploy` | 创建 `.env`、在本仓库 `.venv` 执行 `uv sync`、`npm install`；无 Docker 时数据库改为 SQLite |
 | `deploy --with-infra` / `-WithInfra` | 上述步骤 + `docker compose up -d` |
-| `start` | 后台启动后端 `:8000` 与前端 `:5173` |
+| `start` | 后台启动后端 `:8000`（项目 `.venv`）与前端 `:5173` |
 | `stop` | 停止前后端（按 PID 与端口） |
 | `stop --all` / `-All` | 同时 `docker compose down` |
 | `restart` | 停止后再次启动 |
@@ -171,26 +301,7 @@ chmod +x deploy.sh start.sh stop.sh restart.sh status.sh scripts/akrag.sh script
 - 后端健康检查：http://127.0.0.1:8000/health
 - OpenAPI：http://127.0.0.1:8000/docs
 
-## 手动启动（不使用脚本）
-
-```bash
-# 配置
-cp .env.example .env
-# 无 Docker 时建议改为：
-# DATABASE_URL=sqlite+aiosqlite:///./data/akrag.db
-
-uv sync
-cd frontend && npm install && cd ..
-
-# 可选中间件
-docker compose up -d
-
-# 后端（在仓库根目录执行，以便读取 .env 与 data/）
-uv run uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port 8000
-
-# 前端
-cd frontend && npm run dev
-```
+不使用脚本时，见上文「环境配置与依赖安装」。
 
 ## 降级行为
 
@@ -249,6 +360,7 @@ STORAGE_DIR=data/storage
 ## 开发
 
 ```bash
+# Windows 若仍报 orjson / langgraph 导入错误，先执行：$env:PYTHONPATH=''; $env:PIP_TARGET=''
 uv sync --extra dev
 uv run pytest backend/tests
 ```
